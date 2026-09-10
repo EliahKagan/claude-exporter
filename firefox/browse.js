@@ -872,8 +872,7 @@ async function exportAllFiltered() {
   const cancelButton = document.getElementById('cancelExport');
   cancelButton.onclick = () => {
     cancelExport = true;
-    progressModal.style.display = 'none';
-    showToast('Export cancelled', true);
+    progressText.textContent = 'Cancelling — packaging what has been exported so far...';
   };
 
   try {
@@ -1022,24 +1021,37 @@ async function exportAllFiltered() {
       progressStats.textContent = `${completed} succeeded, ${failed} failed out of ${total}`;
     }
 
-    if (cancelExport) return;
-
+    const cancelledEarly = cancelExport;
     const exportedCount = manifestEntries.filter(entry => entry.status === 'exported').length;
+    if (cancelledEarly && exportedCount === 0) {
+      progressModal.style.display = 'none';
+      showToast('Export cancelled — nothing had been exported yet.', true);
+      return;
+    }
 
     // Reconcile before anything is reported as exported: an entry only counts
     // if every file it claims is actually in the archive.
     const reconciliation = reconcileManifest(manifestEntries, zip);
+
+    for (const entry of manifestEntries) {
+      if (entry.status === 'pending') {
+        entry.status = 'cancelled';
+        entry.reason = 'export cancelled before this conversation was attempted';
+      }
+    }
 
     // Written with a plain zip.file: the name is reserved in the dedup set
     // above, so it cannot collide, and a throw here would destroy the whole
     // archive at the last step.
     zip.file(EXPORT_MANIFEST_FILENAME, JSON.stringify({
       generatedAt: new Date().toISOString(),
+      cancelled: cancelledEarly,
       total,
       counts: {
         exported: exportedCount,
         skipped: manifestEntries.filter(entry => entry.status === 'skipped').length,
-        failed: manifestEntries.filter(entry => entry.status === 'failed').length
+        failed: manifestEntries.filter(entry => entry.status === 'failed').length,
+        cancelled: manifestEntries.filter(entry => entry.status === 'cancelled').length
       },
       reconciliation,
       conversations: manifestEntries
@@ -1067,7 +1079,7 @@ async function exportAllFiltered() {
     const datetime = getLocalDateTimeString();
     // Use 'claude-artifacts' when ONLY flat artifacts are exported
     const prefix = (flattenArtifacts && !extractArtifacts && includeChats === false) ? 'claude-artifacts' : 'claude-exports';
-    a.download = `${prefix}-${datetime}.zip`;
+    a.download = `${prefix}${cancelledEarly ? '-partial' : ''}-${datetime}.zip`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -1093,7 +1105,9 @@ async function exportAllFiltered() {
       );
     }
 
-    if (failed > 0) {
+    if (cancelledEarly) {
+      showToast(`Export cancelled — partial ZIP with ${exportedCount} of ${total} conversations downloaded.`);
+    } else if (failed > 0) {
       showToast(`Exported ${completed} of ${total} conversations (${failed} failed).`);
     } else {
       showToast(`Successfully exported all ${completed} conversations!`);
