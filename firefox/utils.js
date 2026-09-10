@@ -1038,6 +1038,133 @@ function generateDiagnostics(onComplete) {
   );
 }
 
+// ----- Bulk export helpers -----
+
+// Reserved ZIP entry name for the per-run export manifest.
+const EXPORT_MANIFEST_FILENAME = 'export-manifest.json';
+
+const MAX_RETRY_ATTEMPTS = 6;
+const MAX_RETRY_DELAY_MS = 60000;
+const MAX_PACER_INTERVAL_MS = 5000;
+
+// Assign a collision-free base filename to every conversation up front, before
+// the export loop runs, so numbering never depends on completion order.
+// Mirrors the usedFilenames dedup in extractArtifactFiles, with one change:
+// comparison is case-insensitive, because a ZIP happily holds both Recipe.md
+// and recipe.md but extracting it on Windows or macOS loses one of them.
+function dedupeConversationNames(conversations, reservedNames = []) {
+  const used = new Set(reservedNames.map(name => name.toLowerCase()));
+  const assigned = new Map();
+
+  for (const conv of conversations) {
+    const title = (conv.name || '').trim();
+    // Null, empty and whitespace-only titles fall back to the UUID rather than
+    // producing a file called ".md".
+    const base = (title || conv.uuid).replace(/[<>:"/\\|?*]/g, '_');
+
+    let name = base;
+    let counter = 1;
+    while (used.has(name.toLowerCase())) {
+      name = `${base}_${counter}`;
+      counter++;
+    }
+
+    used.add(name.toLowerCase());
+    assigned.set(conv.uuid, name);
+  }
+
+  return assigned;
+}
+
+// How long to wait before retrying, in ms, or null to not retry at all. Pure —
+// the caller owns the clock. Only 429 backs off: a 403 from claude.ai is
+// commonly a VPN artifact rather than throttling, so retrying it only turns a
+// fast failure into a slow one.
+function computeRetryDelay(status, retryAfterHeader, attempt) {
+  if (status !== 429) return null;
+  if (attempt >= MAX_RETRY_ATTEMPTS) return null;
+
+  // Retry-After may legally be an HTTP-date; only the delta-seconds form is
+  // honored, and anything else falls through to the exponential fallback.
+  const header = typeof retryAfterHeader === 'string' ? retryAfterHeader.trim() : '';
+  if (/^\d+$/.test(header)) {
+    return Math.min(Number(header) * 1000, MAX_RETRY_DELAY_MS);
+  }
+
+  return Math.min(1000 * Math.pow(2, attempt), MAX_RETRY_DELAY_MS);
+}
+
+// Pacing state for one export run. Shared across requests but never across
+// runs; safe as plain state only because the export loops are sequential.
+function createPacer(intervalMs) {
+  return { intervalMs, notBefore: 0 };
+}
+
+// fetch() that waits for the pacer, retries 429s, and returns the final
+// response (including a 429 that exhausted its attempts) for the caller to
+// check with response.ok as usual.
+async function fetchWithBackoff(url, options, pacer) {
+  for (let attempt = 0; ; attempt++) {
+    const waitMs = pacer.notBefore - Date.now();
+    if (waitMs > 0) {
+      await new Promise(resolve => setTimeout(resolve, waitMs));
+    }
+
+    const response = await fetch(url, options);
+    pacer.notBefore = Date.now() + pacer.intervalMs;
+
+    if (response.status !== 429) {
+      return response;
+    }
+
+    const delay = computeRetryDelay(response.status, response.headers.get('Retry-After'), attempt);
+    if (delay === null) {
+      return response;
+    }
+
+    // Widen the interval permanently, not just for this retry. Dropping back to
+    // the base interval as soon as one request succeeds walks straight back
+    // into the limiter on the next few conversations.
+    pacer.intervalMs = Math.min(pacer.intervalMs * 2, MAX_PACER_INTERVAL_MS);
+    pacer.notBefore = Date.now() + delay;
+  }
+}
+
+// JSZip keys entries by name, so writing the same path twice silently replaces
+// the first write and a conversation disappears from the archive with no error
+// raised anywhere. Refuse the second write instead, so a duplicate surfaces at
+// the moment it happens rather than as a short ZIP.
+function addZipFile(zip, path, content) {
+  if (zip.file(path)) {
+    throw new Error(`Duplicate ZIP entry: ${path}`);
+  }
+  zip.file(path, content);
+}
+
+// Enforces "never claim success for data that is not in the archive": an entry
+// may only be treated as exported, and its conversation timestamped, if every
+// file it claims to have written is actually present in the ZIP.
+function reconcileManifest(entries, zip) {
+  const missing = [];
+
+  for (const entry of entries) {
+    if (entry.status !== 'exported') continue;
+
+    const files = entry.files || [];
+    if (files.length === 0) {
+      missing.push({ uuid: entry.uuid, title: entry.title, reason: 'marked exported but wrote no files' });
+      continue;
+    }
+
+    const absent = files.filter(path => !zip.file(path));
+    if (absent.length > 0) {
+      missing.push({ uuid: entry.uuid, title: entry.title, reason: `missing from archive: ${absent.join(', ')}` });
+    }
+  }
+
+  return { ok: missing.length === 0, missing };
+}
+
 // Functions are available globally in the browser context
 // In Node (vitest), expose them via module.exports for testing
 if (typeof module !== 'undefined' && module.exports) {
@@ -1061,5 +1188,12 @@ if (typeof module !== 'undefined' && module.exports) {
     importBackup,
     mergeStorageData,
     sanitizeForDiagnostics,
+    EXPORT_MANIFEST_FILENAME,
+    dedupeConversationNames,
+    computeRetryDelay,
+    createPacer,
+    fetchWithBackoff,
+    addZipFile,
+    reconcileManifest,
   };
 }
