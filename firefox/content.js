@@ -371,10 +371,7 @@ function getLocalDateTimeString() {
 
           // Only conversations whose files are provably in the archive get a
           // timestamp; anything else stays flagged as new on the next run.
-          const unreconciled = new Set(reconciliation.missing.map(item => item.uuid));
-          recordExportTimestamps(manifestEntries
-            .filter(entry => entry.status === 'exported' && !unreconciled.has(entry.uuid))
-            .map(entry => entry.uuid));
+          recordExportTimestamps(exportedUuids(manifestEntries, reconciliation));
 
           if (!reconciliation.ok) {
             // Loud on purpose: the archive does not contain what the run just

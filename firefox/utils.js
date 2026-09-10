@@ -1165,6 +1165,17 @@ function reconcileManifest(entries, zip) {
   return { ok: missing.length === 0, missing };
 }
 
+// The UUIDs a run may record as exported: entries marked exported whose files
+// all reconciled. This is precisely where the old failure tracking went wrong —
+// it recorded failures keyed by title and then tested those strings for a UUID,
+// so any named conversation that failed was written down as a success.
+function exportedUuids(entries, reconciliation) {
+  const unreconciled = new Set((reconciliation.missing || []).map(item => item.uuid));
+  return entries
+    .filter(entry => entry.status === 'exported' && !unreconciled.has(entry.uuid))
+    .map(entry => entry.uuid);
+}
+
 // Functions are available globally in the browser context
 // In Node (vitest), expose them via module.exports for testing
 if (typeof module !== 'undefined' && module.exports) {
@@ -1195,5 +1206,6 @@ if (typeof module !== 'undefined' && module.exports) {
     fetchWithBackoff,
     addZipFile,
     reconcileManifest,
+    exportedUuids,
   };
 }

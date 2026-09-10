@@ -1078,11 +1078,7 @@ async function exportAllFiltered() {
     // Record export timestamps only for conversations whose files are provably
     // in the archive, so a failed or clobbered conversation stays flagged as
     // new on the next run.
-    const unreconciled = new Set(reconciliation.missing.map(item => item.uuid));
-    const exportedIds = manifestEntries
-      .filter(entry => entry.status === 'exported' && !unreconciled.has(entry.uuid))
-      .map(entry => entry.uuid);
-    await saveExportTimestamps(exportedIds);
+    await saveExportTimestamps(exportedUuids(manifestEntries, reconciliation));
     displayConversations();
     updateStats();
 
