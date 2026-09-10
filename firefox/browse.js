@@ -882,32 +882,53 @@ async function exportAllFiltered() {
     const total = conversationsToExport.length;
     let completed = 0;
     let failed = 0;
-    const failedConversations = [];
+
+    // One manifest entry per conversation, created up front so every
+    // conversation in the export set appears exactly once regardless of what
+    // happens to it. Keyed by UUID, never by title — titles collide.
+    const manifestEntries = conversationsToExport.map(conv => ({
+      uuid: conv.uuid,
+      title: conv.name || null,
+      status: 'pending',
+      files: []
+    }));
+    const manifestByUuid = new Map(manifestEntries.map(entry => [entry.uuid, entry]));
+
+    // Collision-free names for every conversation, decided before the loop so
+    // numbering does not depend on completion order.
+    const safeNames = dedupeConversationNames(conversationsToExport, [
+      EXPORT_MANIFEST_FILENAME.replace(/\.json$/, '')
+    ]);
+
+    const pacer = createPacer(200);
 
     progressText.textContent = `Exporting ${total} conversations...`;
 
-    // Process conversations in batches to avoid overwhelming the API
-    const batchSize = 3; // Process 3 at a time
+    // One conversation at a time: concurrent requests are what trips the API
+    // rate limiter on large exports.
+    const batchSize = 1;
     for (let i = 0; i < total; i += batchSize) {
       if (cancelExport) break;
 
       const batch = conversationsToExport.slice(i, Math.min(i + batchSize, total));
       const promises = batch.map(async (conv) => {
+        const entry = manifestByUuid.get(conv.uuid);
         try {
-          const response = await fetch(
+          const response = await fetchWithBackoff(
             `https://claude.ai/api/organizations/${orgId}/chat_conversations/${conv.uuid}?tree=True&rendering_mode=messages&render_all_tools=true`,
             {
               credentials: 'include',
               headers: {
                 'Accept': 'application/json',
               }
-            }
+            },
+            pacer
           );
-          
+
           if (!response.ok) {
             throw new Error(`HTTP ${response.status}`);
           }
-          
+
           const data = await response.json();
 
           // Infer model if null
@@ -919,13 +940,15 @@ async function exportAllFiltered() {
           // If chats are disabled and no artifacts, skip this conversation
           if (includeChats === false && artifactFiles.length === 0) {
             console.log(`Skipping ${conv.name} - no artifacts found (chats disabled)`);
+            entry.status = 'skipped';
+            entry.reason = 'no artifacts found (chats disabled)';
             completed++; // Count as completed even though skipped
             return; // Skip this conversation in the promise
           }
 
           // Generate filename and content based on format
           let content, filename;
-          const safeName = conv.name.replace(/[<>:"/\\|?*]/g, '_'); // Remove invalid filename characters
+          const safeName = safeNames.get(conv.uuid);
 
           switch (format) {
             case 'markdown':
@@ -941,70 +964,86 @@ async function exportAllFiltered() {
               filename = `${safeName}.json`;
           }
 
+          // Every write goes through addZipFile with a full root-relative path,
+          // so the manifest records exactly the path that was written.
+          const writeFile = (path, body) => {
+            addZipFile(zip, path, body);
+            entry.files.push(path);
+          };
+
           // Flat export: use Chats and Artifacts top-level folders
           if (flattenArtifacts && !extractArtifacts) {
             // Add chat file to Chats folder if chats are enabled
             if (includeChats !== false) {
-              const chatsFolder = zip.folder('Chats');
-              chatsFolder.file(filename, content);
+              writeFile(`Chats/${filename}`, content);
             }
 
             // Add artifacts to Artifacts folder with conversation name prefix
-            if (artifactFiles.length > 0) {
-              const artifactsFolder = zip.folder('Artifacts');
-              for (const artifact of artifactFiles) {
-                const artifactFilename = `${safeName}_${artifact.filename}`;
-                artifactsFolder.file(artifactFilename, artifact.content);
-              }
+            for (const artifact of artifactFiles) {
+              writeFile(`Artifacts/${safeName}_${artifact.filename}`, artifact.content);
             }
           }
           // Nested export: create per-conversation folders with artifacts subfolder
           else if (extractArtifacts) {
-            const convFolder = zip.folder(safeName);
-
             // Add conversation file only if includeChats is true
             if (includeChats !== false) {
-              convFolder.file(filename, content);
+              writeFile(`${safeName}/${filename}`, content);
             }
 
             // Add artifact files in nested artifacts subfolder
-            if (artifactFiles.length > 0) {
-              const artifactsFolder = includeChats !== false ? convFolder.folder('artifacts') : convFolder;
-              for (const artifact of artifactFiles) {
-                artifactsFolder.file(artifact.filename, artifact.content);
-              }
+            const artifactPrefix = includeChats !== false ? `${safeName}/artifacts/` : `${safeName}/`;
+            for (const artifact of artifactFiles) {
+              writeFile(`${artifactPrefix}${artifact.filename}`, artifact.content);
             }
           } else {
             // No artifact extraction - add file to ZIP root only if chats are enabled
             if (includeChats !== false) {
-              zip.file(filename, content);
+              writeFile(filename, content);
             }
           }
 
+          entry.status = 'exported';
           completed++;
-          
+
         } catch (error) {
           console.error(`Failed to export ${conv.name}:`, error);
+          entry.status = 'failed';
+          entry.reason = error.message;
           failed++;
-          failedConversations.push(conv.name);
         }
       });
-      
+
       // Wait for batch to complete
       await Promise.all(promises);
-      
+
       // Update progress
       const progress = Math.round((completed + failed) / total * 100);
       progressBar.style.width = `${progress}%`;
       progressStats.textContent = `${completed} succeeded, ${failed} failed out of ${total}`;
-      
-      // Small delay between batches
-      if (i + batchSize < total && !cancelExport) {
-        await new Promise(resolve => setTimeout(resolve, 200));
-      }
     }
-    
+
     if (cancelExport) return;
+
+    const exportedCount = manifestEntries.filter(entry => entry.status === 'exported').length;
+
+    // Reconcile before anything is reported as exported: an entry only counts
+    // if every file it claims is actually in the archive.
+    const reconciliation = reconcileManifest(manifestEntries, zip);
+
+    // Written with a plain zip.file: the name is reserved in the dedup set
+    // above, so it cannot collide, and a throw here would destroy the whole
+    // archive at the last step.
+    zip.file(EXPORT_MANIFEST_FILENAME, JSON.stringify({
+      generatedAt: new Date().toISOString(),
+      total,
+      counts: {
+        exported: exportedCount,
+        skipped: manifestEntries.filter(entry => entry.status === 'skipped').length,
+        failed: manifestEntries.filter(entry => entry.status === 'failed').length
+      },
+      reconciliation,
+      conversations: manifestEntries
+    }, null, 2));
 
     // Generate and download the ZIP file
     progressText.textContent = 'Creating ZIP file...';
@@ -1019,7 +1058,7 @@ async function exportAllFiltered() {
       const zipProgress = Math.round(metadata.percent);
       progressBar.style.width = `${zipProgress}%`;
     });
-    
+
     // Download the ZIP file
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -1033,23 +1072,37 @@ async function exportAllFiltered() {
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
-    
+
     progressModal.style.display = 'none';
 
-    // Record export timestamps for successfully exported conversations
-    const exportedIds = conversationsToExport
-      .filter(conv => !failedConversations.includes(conv.name))
-      .map(conv => conv.uuid);
+    // Record export timestamps only for conversations whose files are provably
+    // in the archive, so a failed or clobbered conversation stays flagged as
+    // new on the next run.
+    const unreconciled = new Set(reconciliation.missing.map(item => item.uuid));
+    const exportedIds = manifestEntries
+      .filter(entry => entry.status === 'exported' && !unreconciled.has(entry.uuid))
+      .map(entry => entry.uuid);
     await saveExportTimestamps(exportedIds);
     displayConversations();
     updateStats();
+
+    if (!reconciliation.ok) {
+      // Loud on purpose: this means the archive does not contain what the run
+      // just claimed it does, and a toast is too easy to miss.
+      alert(
+        `Export integrity check FAILED for ${reconciliation.missing.length} conversation(s).\n\n` +
+        `Their files are missing from the ZIP. They have NOT been marked as exported, ` +
+        `so they will still show as new.\n\n` +
+        `See ${EXPORT_MANIFEST_FILENAME} inside the ZIP for details.`
+      );
+    }
 
     if (failed > 0) {
       showToast(`Exported ${completed} of ${total} conversations (${failed} failed).`);
     } else {
       showToast(`Successfully exported all ${completed} conversations!`);
     }
-    
+
   } catch (error) {
     console.error('Export error:', error);
     progressModal.style.display = 'none';
