@@ -81,15 +81,15 @@ function getLocalDateTimeString() {
 }
 
   // Fetch conversation data
-  async function fetchConversation(orgId, conversationId) {
+  async function fetchConversation(orgId, conversationId, pacer = createPacer(0)) {
     const url = `https://claude.ai/api/organizations/${orgId}/chat_conversations/${conversationId}?tree=True&rendering_mode=messages&render_all_tools=true`;
 
-    const response = await fetch(url, {
+    const response = await fetchWithBackoff(url, {
       credentials: 'include',
       headers: {
         'Accept': 'application/json',
       }
-    });
+    }, pacer);
 
     if (!response.ok) {
       throw new Error(`Failed to fetch conversation: ${response.status}`);
@@ -316,18 +316,94 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       .then(async conversations => {
         console.log(`Fetched ${conversations.length} conversations`);
         
+        // One manifest entry per conversation, created up front so every
+        // conversation appears exactly once. Keyed by UUID: the old code keyed
+        // failures by name and then tested those strings for the UUID, so any
+        // named conversation that failed was recorded as successfully exported.
+        const manifestEntries = conversations.map(conv => ({
+          uuid: conv.uuid,
+          title: conv.name || null,
+          status: 'pending',
+          files: []
+        }));
+        const manifestByUuid = new Map(manifestEntries.map(entry => [entry.uuid, entry]));
+
+        // Collision-free names decided before the loop, so numbering does not
+        // depend on completion order.
+        const safeNames = dedupeConversationNames(conversations, [
+          EXPORT_MANIFEST_FILENAME.replace(/\.json$/, '')
+        ]);
+
+        const pacer = createPacer(500);
+
+        // Shared tail for both export shapes.
+        const finishExport = async (zip, prefix) => {
+          const reconciliation = reconcileManifest(manifestEntries, zip);
+
+          // Plain zip.file: the name is reserved in the dedup set above, so it
+          // cannot collide, and throwing here would destroy the whole archive
+          // at the last step.
+          zip.file(EXPORT_MANIFEST_FILENAME, JSON.stringify({
+            generatedAt: new Date().toISOString(),
+            total: manifestEntries.length,
+            counts: {
+              exported: manifestEntries.filter(entry => entry.status === 'exported').length,
+              skipped: manifestEntries.filter(entry => entry.status === 'skipped').length,
+              failed: manifestEntries.filter(entry => entry.status === 'failed').length
+            },
+            reconciliation,
+            conversations: manifestEntries
+          }, null, 2));
+
+          // Awaited: the old code started generateAsync and recorded export
+          // timestamps without waiting for it, so a generation failure still
+          // left every conversation marked as exported.
+          const blob = await zip.generateAsync({ type: 'blob' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `${prefix}-${getLocalDateTimeString()}.zip`;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+
+          // Only conversations whose files are provably in the archive get a
+          // timestamp; anything else stays flagged as new on the next run.
+          const unreconciled = new Set(reconciliation.missing.map(item => item.uuid));
+          recordExportTimestamps(manifestEntries
+            .filter(entry => entry.status === 'exported' && !unreconciled.has(entry.uuid))
+            .map(entry => entry.uuid));
+
+          if (!reconciliation.ok) {
+            // Loud on purpose: the archive does not contain what the run just
+            // claimed it does.
+            alert(
+              `Export integrity check FAILED for ${reconciliation.missing.length} conversation(s).\n\n` +
+              `Their files are missing from the ZIP. They have NOT been marked as exported.\n\n` +
+              `See ${EXPORT_MANIFEST_FILENAME} inside the ZIP for details.`
+            );
+          }
+
+          return manifestEntries.filter(entry => entry.status === 'exported').length;
+        };
+
+        const describeFailures = () => manifestEntries
+          .filter(entry => entry.status === 'failed')
+          .map(entry => `${entry.title || entry.uuid}: ${entry.reason}`);
+
         if (request.extractArtifacts || request.flattenArtifacts) {
           // When extracting artifacts (nested or flat), always create a ZIP
           const zip = new JSZip();
           let processed = 0;
           let included = 0;
-          let errors = [];
 
           for (const conv of conversations) {
+            const entry = manifestByUuid.get(conv.uuid);
             try {
               processed++;
               console.log(`Scanning conversation ${processed}/${conversations.length}: ${conv.name || conv.uuid}`);
-              const fullConv = await fetchConversation(request.orgId, conv.uuid);
+              const fullConv = await fetchConversation(request.orgId, conv.uuid, pacer);
 
               // Infer model if null
               fullConv.model = inferModel(fullConv);
@@ -338,13 +414,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               // If chats are disabled and no artifacts, skip this conversation
               if (request.includeChats === false && artifactFiles.length === 0) {
                 console.log(`  Skipping - no artifacts found (${processed}/${conversations.length} scanned, ${included} included)`);
-                // Add a small delay to avoid overwhelming the API
-                await new Promise(resolve => setTimeout(resolve, 500));
+                entry.status = 'skipped';
+                entry.reason = 'no artifacts found (chats disabled)';
                 continue;
               }
 
-              // Sanitize folder name
-              const folderName = (conv.name || conv.uuid).replace(/[<>:"/\\|?*]/g, '_');
+              const folderName = safeNames.get(conv.uuid);
 
               // Generate conversation content
               let conversationContent, conversationFilename;
@@ -359,98 +434,81 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                 conversationFilename = `${folderName}.json`;
               }
 
+              // Every write goes through addZipFile with a full root-relative
+              // path, so the manifest records exactly what was written.
+              const writeFile = (path, body) => {
+                addZipFile(zip, path, body);
+                entry.files.push(path);
+              };
+
               // Flat export: use Chats and Artifacts top-level folders
               if (request.flattenArtifacts && !request.extractArtifacts) {
                 // Add chat file to Chats folder if chats are enabled
                 if (request.includeChats !== false) {
-                  const chatsFolder = zip.folder('Chats');
-                  chatsFolder.file(conversationFilename, conversationContent);
+                  writeFile(`Chats/${conversationFilename}`, conversationContent);
                 }
 
                 // Add artifacts to Artifacts folder with conversation name prefix
-                if (artifactFiles.length > 0) {
-                  const artifactsFolder = zip.folder('Artifacts');
-                  for (const artifact of artifactFiles) {
-                    const artifactFilename = `${folderName}_${artifact.filename}`;
-                    artifactsFolder.file(artifactFilename, artifact.content);
-                  }
+                for (const artifact of artifactFiles) {
+                  writeFile(`Artifacts/${folderName}_${artifact.filename}`, artifact.content);
                 }
               }
               // Nested export: create per-conversation folders with artifacts subfolder
               else if (request.extractArtifacts) {
-                const convFolder = zip.folder(folderName);
-
                 // Add conversation file only if includeChats is true
                 if (request.includeChats !== false) {
-                  convFolder.file(conversationFilename, conversationContent);
+                  writeFile(`${folderName}/${conversationFilename}`, conversationContent);
                 }
 
                 // Add artifact files in nested artifacts subfolder
-                if (artifactFiles.length > 0) {
-                  const artifactsFolder = request.includeChats !== false ? convFolder.folder('artifacts') : convFolder;
-                  for (const artifact of artifactFiles) {
-                    artifactsFolder.file(artifact.filename, artifact.content);
-                  }
+                const artifactPrefix = request.includeChats !== false ? `${folderName}/artifacts/` : `${folderName}/`;
+                for (const artifact of artifactFiles) {
+                  writeFile(`${artifactPrefix}${artifact.filename}`, artifact.content);
                 }
               }
 
+              entry.status = 'exported';
               included++;
               console.log(`  Added to export (${processed}/${conversations.length} scanned, ${included} included)`);
-
-              // Add a small delay to avoid overwhelming the API
-              await new Promise(resolve => setTimeout(resolve, 500));
             } catch (error) {
               console.error(`Failed to export conversation ${conv.uuid}:`, error);
-              errors.push(`${conv.name || conv.uuid}: ${error.message}`);
+              entry.status = 'failed';
+              entry.reason = error.message;
             }
           }
 
-          // Generate and download ZIP
-          zip.generateAsync({ type: 'blob' }).then(blob => {
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            // Format: claude-artifacts-20251031-143045.zip or claude-exports-20251031-143045.zip
-            const datetime = getLocalDateTimeString();
-            // Use 'claude-artifacts' when ONLY flat artifacts are exported
-            const prefix = (request.flattenArtifacts && !request.extractArtifacts && request.includeChats === false) ? 'claude-artifacts' : 'claude-exports';
-            a.download = `${prefix}-${datetime}.zip`;
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            URL.revokeObjectURL(url);
-          });
+          // Use 'claude-artifacts' when ONLY flat artifacts are exported
+          const prefix = (request.flattenArtifacts && !request.extractArtifacts && request.includeChats === false) ? 'claude-artifacts' : 'claude-exports';
+          const exportedCount = await finishExport(zip, prefix);
 
-          // Record export timestamps for all successfully exported conversations
-          const exportedIds = conversations.map(c => c.uuid).filter(id => !errors.some(e => e.includes(id)));
-          recordExportTimestamps(exportedIds);
-
+          const errors = describeFailures();
           if (errors.length > 0) {
             console.warn('Some conversations failed to export:', errors);
             sendResponse({
               success: true,
-              count: included,
-              warnings: `Exported ${included}/${conversations.length} conversations. Some failed: ${errors.join('; ')}`
+              count: exportedCount,
+              warnings: `Exported ${exportedCount}/${conversations.length} conversations. Some failed: ${errors.join('; ')}`
             });
           } else {
-            sendResponse({ success: true, count: included });
+            sendResponse({ success: true, count: exportedCount });
           }
         } else {
           // For other formats without artifact extraction, create a ZIP
           const zip = new JSZip();
-          let count = 0;
-          let errors = [];
+          let processed = 0;
 
           for (const conv of conversations) {
+            const entry = manifestByUuid.get(conv.uuid);
             try {
-              console.log(`Fetching full conversation ${count + 1}/${conversations.length}: ${conv.uuid}`);
-              const fullConv = await fetchConversation(request.orgId, conv.uuid);
+              processed++;
+              console.log(`Fetching full conversation ${processed}/${conversations.length}: ${conv.uuid}`);
+              const fullConv = await fetchConversation(request.orgId, conv.uuid, pacer);
 
               // Infer model if null
               fullConv.model = inferModel(fullConv);
 
               let content, filename;
-              const safeName = (conv.name || conv.uuid).replace(/[<>:"/\\|?*]/g, '_');
+              const safeName = safeNames.get(conv.uuid);
 
               if (request.format === 'markdown') {
                 content = convertToMarkdown(fullConv, request.includeMetadata, conv.uuid, request.includeArtifacts, request.includeThinking);
@@ -463,43 +521,28 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                 filename = `${safeName}.json`;
               }
 
-              zip.file(filename, content);
-              count++;
-
-              // Add a small delay to avoid overwhelming the API
-              await new Promise(resolve => setTimeout(resolve, 500));
+              addZipFile(zip, filename, content);
+              entry.files.push(filename);
+              entry.status = 'exported';
             } catch (error) {
               console.error(`Failed to export conversation ${conv.uuid}:`, error);
-              errors.push(`${conv.name || conv.uuid}: ${error.message}`);
+              entry.status = 'failed';
+              entry.reason = error.message;
             }
           }
 
-          // Generate and download ZIP
-          zip.generateAsync({ type: 'blob' }).then(blob => {
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            const datetime = getLocalDateTimeString();
-            a.download = `claude-exports-${datetime}.zip`;
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            URL.revokeObjectURL(url);
-          });
+          const exportedCount = await finishExport(zip, 'claude-exports');
 
-          // Record export timestamps for successfully exported conversations
-          const exportedIds = conversations.map(c => c.uuid).filter(id => !errors.some(e => e.includes(id)));
-          recordExportTimestamps(exportedIds);
-
+          const errors = describeFailures();
           if (errors.length > 0) {
             console.warn('Some conversations failed to export:', errors);
             sendResponse({
               success: true,
-              count,
-              warnings: `Exported ${count}/${conversations.length} conversations. Some failed: ${errors.join('; ')}`
+              count: exportedCount,
+              warnings: `Exported ${exportedCount}/${conversations.length} conversations. Some failed: ${errors.join('; ')}`
             });
           } else {
-            sendResponse({ success: true, count });
+            sendResponse({ success: true, count: exportedCount });
           }
         }
       })
