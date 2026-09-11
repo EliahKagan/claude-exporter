@@ -8,6 +8,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import JSZip from '../chrome/jszip.min.js';
 
 const {
+  EXPORT_MANIFEST_BASENAME,
   EXPORT_MANIFEST_FILENAME,
   dedupeConversationNames,
   computeRetryDelay,
@@ -64,12 +65,7 @@ describe('dedupeConversationNames', () => {
     expect(names.get('uuid-abc')).toBe('uuid-abc');
   });
 
-  it('does not produce a bare extension for an empty title', () => {
-    const names = dedupeConversationNames([conv('uuid-abc', '')]);
-    expect(`${names.get('uuid-abc')}.md`).not.toBe('.md');
-  });
-
-  it('strips characters that are invalid in filenames', () => {
+  it('strips the <>:"/\\|?* character set', () => {
     const names = dedupeConversationNames([conv('u1', 'a/b:c*d?e"f<g>h|i')]);
     expect(names.get('u1')).toBe('a_b_c_d_e_f_g_h_i');
   });
@@ -81,10 +77,51 @@ describe('dedupeConversationNames', () => {
   });
 
   it('honours reserved names so the manifest cannot be claimed', () => {
-    const reserved = EXPORT_MANIFEST_FILENAME.replace(/\.json$/, '');
-    const names = dedupeConversationNames([conv('u1', reserved)], [reserved]);
-    expect(names.get('u1')).not.toBe(reserved);
-    expect(`${names.get('u1')}.json`).not.toBe(EXPORT_MANIFEST_FILENAME);
+    const names = dedupeConversationNames(
+      [conv('u1', EXPORT_MANIFEST_BASENAME)], [EXPORT_MANIFEST_BASENAME, EXPORT_MANIFEST_FILENAME]);
+    expect(names.get('u1')).not.toBe(EXPORT_MANIFEST_BASENAME);
+  });
+
+  it('compares reserved names case-insensitively', () => {
+    // A conversation titled "Export-Manifest" would otherwise keep that name
+    // and collide with export-manifest.json when extracted.
+    const names = dedupeConversationNames(
+      [conv('u1', 'Export-Manifest')], [EXPORT_MANIFEST_BASENAME, EXPORT_MANIFEST_FILENAME]);
+    expect(names.get('u1').toLowerCase()).not.toBe(EXPORT_MANIFEST_BASENAME);
+  });
+
+  it('folds the case of caller-supplied reserved names too', () => {
+    const names = dedupeConversationNames([conv('u1', 'export-manifest')], ['EXPORT-MANIFEST']);
+    expect(names.get('u1')).not.toBe('export-manifest');
+  });
+
+  it('reserves the full manifest filename, not just its basename', () => {
+    // In nested mode this title becomes a folder, which collides on disk with
+    // the root export-manifest.json file.
+    const names = dedupeConversationNames(
+      [conv('u1', EXPORT_MANIFEST_FILENAME)], [EXPORT_MANIFEST_BASENAME, EXPORT_MANIFEST_FILENAME]);
+    expect(names.get('u1')).not.toBe(EXPORT_MANIFEST_FILENAME);
+  });
+
+  it('protects a real doc_1 regardless of input order', () => {
+    // The favourable order is doc, doc_1, doc. In this adversarial order the
+    // duplicate reaches doc_1 before its rightful owner does.
+    const names = dedupeConversationNames([
+      conv('u1', 'doc'), conv('u2', 'doc'), conv('u3', 'doc_1'),
+    ]);
+    expect(names.get('u3')).toBe('doc_1');
+    expect(names.get('u2')).toBe('doc_2');
+    expect(new Set(names.values()).size).toBe(3);
+  });
+
+  it('assigns exactly one unique name per conversation at scale', () => {
+    // The invariant that actually matters for a 1,000-conversation export.
+    const conversations = Array.from({ length: 1000 }, (_, i) =>
+      conv(`u${i}`, ['same', 'SAME', '', null, `doc_${i % 7}`][i % 5]));
+    const names = dedupeConversationNames(conversations);
+    expect(names.size).toBe(conversations.length);
+    const lowered = [...names.values()].map(n => n.toLowerCase());
+    expect(new Set(lowered).size).toBe(conversations.length);
   });
 });
 
@@ -267,13 +304,98 @@ describe('fetchWithBackoff', () => {
     expect(sentAt - startedAt).toBeGreaterThanOrEqual(5000);
   });
 
-  it('paces the next request from the last one', async () => {
+  it('paces the next request from the last one by exactly the interval', async () => {
     const pacer = createPacer(200);
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response(200)));
 
     await run(fetchWithBackoff('u', {}, pacer));
 
-    expect(pacer.notBefore).toBeGreaterThan(Date.now());
+    expect(pacer.notBefore).toBe(Date.now() + 200);
+  });
+
+  // Records the faked wall-clock time of each request, so the tests below can
+  // assert that a computed delay is actually WAITED rather than merely returned.
+  const recordingFetch = (...responses) => {
+    const sentAt = [];
+    const queue = [...responses];
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(() => {
+      sentAt.push(Date.now());
+      return Promise.resolve(queue.length > 1 ? queue.shift() : queue[0]);
+    }));
+    return sentAt;
+  };
+
+  it('actually waits the Retry-After it was given', async () => {
+    const sentAt = recordingFetch(response(429, '10'), response(200));
+
+    await run(fetchWithBackoff('u', {}, createPacer(200)));
+
+    expect(sentAt).toHaveLength(2);
+    expect(sentAt[1] - sentAt[0]).toBe(10000);
+  });
+
+  it('reads the delay from the Retry-After header, not from the fallback', async () => {
+    // Guards the header wiring: without it this gap would be the 1000ms
+    // exponential fallback.
+    const sentAt = recordingFetch(response(429, '7'), response(200));
+
+    await run(fetchWithBackoff('u', {}, createPacer(200)));
+
+    expect(sentAt[1] - sentAt[0]).toBe(7000);
+  });
+
+  it('waits the exponential fallback when no Retry-After is present', async () => {
+    const sentAt = recordingFetch(response(429), response(200));
+
+    await run(fetchWithBackoff('u', {}, createPacer(200)));
+
+    expect(sentAt[1] - sentAt[0]).toBe(1000);
+  });
+
+  it('does not send immediately when Retry-After is 0', async () => {
+    // Retry-After: 0 must not undo the interval the 429 just widened.
+    const pacer = createPacer(200);
+    const sentAt = recordingFetch(response(429, '0'), response(200));
+
+    await run(fetchWithBackoff('u', {}, pacer));
+
+    expect(sentAt[1] - sentAt[0]).toBe(400);
+  });
+
+  it('caps how far the interval can widen', async () => {
+    const pacer = createPacer(200);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response(429, '0')));
+
+    await run(fetchWithBackoff('u', {}, pacer));
+
+    expect(pacer.intervalMs).toBe(5000);
+  });
+
+  it('carries the slowdown into the next conversation', async () => {
+    // The requirement is that the widened interval survives the request that
+    // hit the limit, so the NEXT conversation is paced too.
+    const pacer = createPacer(200);
+    vi.stubGlobal('fetch', vi.fn()
+      .mockResolvedValueOnce(response(429, '1'))
+      .mockResolvedValue(response(200)));
+    await run(fetchWithBackoff('first', {}, pacer));
+
+    const sentAt = recordingFetch(response(200));
+    const startedAt = Date.now();
+    await run(fetchWithBackoff('second', {}, pacer));
+
+    expect(sentAt[0] - startedAt).toBe(400);
+  });
+
+  it('still paces after fetch rejects', async () => {
+    // A run that loses connectivity must not sprint through every remaining
+    // conversation as fast as fetch can reject.
+    const pacer = createPacer(200);
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('Failed to fetch')));
+
+    await expect(run(fetchWithBackoff('u', {}, pacer))).rejects.toThrow('Failed to fetch');
+
+    expect(pacer.notBefore).toBe(Date.now() + 200);
   });
 });
 
@@ -311,6 +433,38 @@ describe('addZipFile', () => {
     expect(() => addZipFile(zip, 'Artifacts/a.md', 'two')).not.toThrow();
   });
 
+  it('refuses a duplicate that differs only in case', () => {
+    // JSZip compares case-sensitively; Windows and macOS filesystems do not, so
+    // without this both entries are written and one is lost on extraction.
+    const zip = new JSZip();
+    addZipFile(zip, 'Main.py', 'first');
+    expect(() => addZipFile(zip, 'main.py', 'second')).toThrow(/Duplicate ZIP entry/);
+  });
+
+  it('refuses a case-variant duplicate on a nested path', () => {
+    const zip = new JSZip();
+    addZipFile(zip, 'Chats/Recipe.md', 'first');
+    expect(() => addZipFile(zip, 'chats/recipe.md', 'second')).toThrow(/Duplicate ZIP entry/);
+  });
+
+  it('flags the error so callers need not parse its message', () => {
+    const zip = new JSZip();
+    addZipFile(zip, 'a.md', 'first');
+    try {
+      addZipFile(zip, 'a.md', 'second');
+      throw new Error('should have thrown');
+    } catch (error) {
+      expect(error.duplicateZipEntry).toBe(true);
+    }
+  });
+
+  it('keeps its written-path index per ZIP, not globally', () => {
+    const first = new JSZip();
+    const second = new JSZip();
+    addZipFile(first, 'a.md', 'x');
+    expect(() => addZipFile(second, 'a.md', 'y')).not.toThrow();
+  });
+
   it('does not treat a name with regex metacharacters as a pattern', () => {
     const zip = new JSZip();
     addZipFile(zip, 'A+B (v2) [draft].md', 'one');
@@ -337,21 +491,17 @@ describe('reconcileManifest', () => {
     expect(result.missing[0].uuid).toBe('u1');
   });
 
-  it('fires when an overwrite has collapsed two conversations into one', () => {
-    // Simulate the bug addZipFile now prevents: both entries claim the same
-    // path, so only one file exists but two conversations claim success.
+  it('cannot detect an overwrite on its own — addZipFile is that defence', () => {
+    // Documents a real blind spot rather than covering it: if two entries claim
+    // the same path, the archive genuinely holds that path, so reconciliation
+    // passes. Only addZipFile can catch this, at the moment of the second write.
     const zip = new JSZip();
     zip.file('Recipe.md', 'second wins');
     const entries = [
       entry({ uuid: 'u1', files: ['Recipe.md'] }),
       entry({ uuid: 'u2', files: ['Recipe.md'] }),
     ];
-    // Both resolve, because the archive genuinely holds that one path — which
-    // is why addZipFile, not reconciliation, is the primary defence here.
     expect(reconcileManifest(entries, zip).ok).toBe(true);
-    // Remove it and reconciliation catches both.
-    zip.remove('Recipe.md');
-    expect(reconcileManifest(entries, zip).missing.map(m => m.uuid)).toEqual(['u1', 'u2']);
   });
 
   it('fires when an entry claims success but recorded no files', () => {
@@ -378,9 +528,17 @@ describe('reconcileManifest', () => {
   });
 
   it('does not accept a folder entry as the claimed file', () => {
+    // Claims the folder's own key, so a presence check reading zip.files
+    // directly would wrongly pass; zip.file() correctly returns null for it.
     const zip = new JSZip();
     zip.folder('Chats');
+    expect(reconcileManifest([entry({ files: ['Chats/'] })], zip).ok).toBe(false);
     expect(reconcileManifest([entry({ files: ['Chats/a.md'] })], zip).ok).toBe(false);
+  });
+
+  it('ignores cancelled entries', () => {
+    const entries = [entry({ status: 'cancelled', files: [] })];
+    expect(reconcileManifest(entries, new JSZip()).ok).toBe(true);
   });
 });
 
@@ -466,7 +624,23 @@ describe('helpers composed as the export loops use them', () => {
 
     // The manifest records the name actually written, not the original title.
     expect(entries.map(e => e.files)).toEqual([['Recipe.md'], ['Recipe_1.md']]);
-    expect(entries[1].title).toBe('Recipe');
+  });
+
+  it('catches the flat-mode artifact path ambiguity the dedup cannot remove', () => {
+    // Unique conversation names are not enough: conversation "A" with artifact
+    // "B_c.md" and conversation "A_B" with artifact "c.md" both resolve to
+    // Artifacts/A_B_c.md. addZipFile is what stops one silently replacing the
+    // other; the loser is recorded failed and left flagged as new.
+    const zip = new JSZip();
+    addZipFile(zip, 'Artifacts/A_B_c.md', 'from A');
+    let thrown = null;
+    try {
+      addZipFile(zip, 'Artifacts/A_B_c.md', 'from A_B');
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).not.toBeNull();
+    expect(thrown.duplicateZipEntry).toBe(true);
   });
 
   it('reserves the manifest filename against a conversation of that name', () => {

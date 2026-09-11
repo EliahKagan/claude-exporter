@@ -331,7 +331,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         // Collision-free names decided before the loop, so numbering does not
         // depend on completion order.
         const safeNames = dedupeConversationNames(conversations, [
-          EXPORT_MANIFEST_FILENAME.replace(/\.json$/, '')
+          EXPORT_MANIFEST_BASENAME, EXPORT_MANIFEST_FILENAME
         ]);
 
         const pacer = createPacer(500);
@@ -347,7 +347,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             generatedAt: new Date().toISOString(),
             total: manifestEntries.length,
             counts: {
-              exported: manifestEntries.filter(entry => entry.status === 'exported').length,
+              exported: exportedUuids(manifestEntries, reconciliation).length,
               skipped: manifestEntries.filter(entry => entry.status === 'skipped').length,
               failed: manifestEntries.filter(entry => entry.status === 'failed').length
             },
@@ -370,19 +370,23 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
           // Only conversations whose files are provably in the archive get a
           // timestamp; anything else stays flagged as new on the next run.
-          recordExportTimestamps(exportedUuids(manifestEntries, reconciliation));
+          const reconciledIds = exportedUuids(manifestEntries, reconciliation);
+          recordExportTimestamps(reconciledIds);
 
+          // Reported through the popup's existing warnings channel rather than
+          // alert(): a content script's alert is tab-modal, is deferred while
+          // the tab is in the background, and would block sendResponse until
+          // someone dismissed a dialog they cannot see.
+          const problems = [];
           if (!reconciliation.ok) {
-            // Loud on purpose: the archive does not contain what the run just
-            // claimed it does.
-            alert(
-              `Export integrity check FAILED for ${reconciliation.missing.length} conversation(s).\n\n` +
-              `Their files are missing from the ZIP. They have NOT been marked as exported.\n\n` +
-              `See ${EXPORT_MANIFEST_FILENAME} inside the ZIP for details.`
-            );
+            problems.push(`${reconciliation.missing.length} conversation(s) are missing files from the ZIP`);
+          }
+          const duplicates = manifestEntries.filter(entry => entry.duplicateZipEntry);
+          if (duplicates.length > 0) {
+            problems.push(`${duplicates.length} conversation(s) hit a duplicate ZIP path`);
           }
 
-          return manifestEntries.filter(entry => entry.status === 'exported').length;
+          return { count: reconciledIds.length, problems };
         };
 
         const describeFailures = () => manifestEntries
@@ -464,21 +468,27 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                 }
               }
 
-              entry.status = 'exported';
+              entry.status = entry.files.length > 0 ? 'exported' : 'skipped';
+              if (entry.status === 'skipped') {
+                entry.reason = 'nothing to write for the selected options';
+              }
               included++;
               console.log(`  Added to export (${processed}/${conversations.length} scanned, ${included} included)`);
             } catch (error) {
               console.error(`Failed to export conversation ${conv.uuid}:`, error);
               entry.status = 'failed';
               entry.reason = error.message;
+              if (error.duplicateZipEntry) {
+                entry.duplicateZipEntry = true;
+              }
             }
           }
 
           // Use 'claude-artifacts' when ONLY flat artifacts are exported
           const prefix = (request.flattenArtifacts && !request.extractArtifacts && request.includeChats === false) ? 'claude-artifacts' : 'claude-exports';
-          const exportedCount = await finishExport(zip, prefix);
+          const { count: exportedCount, problems } = await finishExport(zip, prefix);
 
-          const errors = describeFailures();
+          const errors = describeFailures().concat(problems);
           if (errors.length > 0) {
             console.warn('Some conversations failed to export:', errors);
             sendResponse({
@@ -525,12 +535,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               console.error(`Failed to export conversation ${conv.uuid}:`, error);
               entry.status = 'failed';
               entry.reason = error.message;
+              if (error.duplicateZipEntry) {
+                entry.duplicateZipEntry = true;
+              }
             }
           }
 
-          const exportedCount = await finishExport(zip, 'claude-exports');
+          const { count: exportedCount, problems } = await finishExport(zip, 'claude-exports');
 
-          const errors = describeFailures();
+          const errors = describeFailures().concat(problems);
           if (errors.length > 0) {
             console.warn('Some conversations failed to export:', errors);
             sendResponse({

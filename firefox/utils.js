@@ -1040,8 +1040,12 @@ function generateDiagnostics(onComplete) {
 
 // ----- Bulk export helpers -----
 
-// Reserved ZIP entry name for the per-run export manifest.
-const EXPORT_MANIFEST_FILENAME = 'export-manifest.json';
+// Reserved ZIP entry name for the per-run export manifest. Both forms are
+// reserved against conversation titles: the basename covers a conversation
+// titled "export-manifest" exported as JSON, the full name covers one titled
+// "export-manifest.json" becoming a folder in nested mode.
+const EXPORT_MANIFEST_BASENAME = 'export-manifest';
+const EXPORT_MANIFEST_FILENAME = `${EXPORT_MANIFEST_BASENAME}.json`;
 
 const MAX_RETRY_ATTEMPTS = 6;
 const MAX_RETRY_DELAY_MS = 60000;
@@ -1053,23 +1057,36 @@ const MAX_PACER_INTERVAL_MS = 5000;
 // comparison is case-insensitive, because a ZIP happily holds both Recipe.md
 // and recipe.md but extracting it on Windows or macOS loses one of them.
 function dedupeConversationNames(conversations, reservedNames = []) {
-  const used = new Set(reservedNames.map(name => name.toLowerCase()));
+  // Null, empty and whitespace-only titles fall back to the UUID rather than
+  // producing a file called ".md".
+  const sanitize = (conv) => {
+    const title = (conv.name || '').trim();
+    return (title || conv.uuid).replace(/[<>:"/\\|?*]/g, '_');
+  };
+
+  // Pass 1: every name a conversation could claim on its own merits. A
+  // deduplicated "doc" must skip past a conversation genuinely titled "doc_1"
+  // rather than take its slot; without this pass the outcome depends on the
+  // order the conversations happen to arrive in.
+  const literals = new Set(reservedNames.map(name => name.toLowerCase()));
+  for (const conv of conversations) {
+    literals.add(sanitize(conv).toLowerCase());
+  }
+
+  const taken = new Set(reservedNames.map(name => name.toLowerCase()));
   const assigned = new Map();
 
   for (const conv of conversations) {
-    const title = (conv.name || '').trim();
-    // Null, empty and whitespace-only titles fall back to the UUID rather than
-    // producing a file called ".md".
-    const base = (title || conv.uuid).replace(/[<>:"/\\|?*]/g, '_');
-
+    const base = sanitize(conv);
     let name = base;
     let counter = 1;
-    while (used.has(name.toLowerCase())) {
+    while (taken.has(name.toLowerCase()) ||
+           (name !== base && literals.has(name.toLowerCase()))) {
       name = `${base}_${counter}`;
       counter++;
     }
 
-    used.add(name.toLowerCase());
+    taken.add(name.toLowerCase());
     assigned.set(conv.uuid, name);
   }
 
@@ -1110,8 +1127,15 @@ async function fetchWithBackoff(url, options, pacer) {
       await new Promise(resolve => setTimeout(resolve, waitMs));
     }
 
-    const response = await fetch(url, options);
-    pacer.notBefore = Date.now() + pacer.intervalMs;
+    let response;
+    try {
+      response = await fetch(url, options);
+    } finally {
+      // Advance the pacer even when fetch rejects, or a run that loses
+      // connectivity sprints through every remaining conversation at full
+      // speed, failing each one.
+      pacer.notBefore = Date.now() + pacer.intervalMs;
+    }
 
     if (response.status !== 429) {
       return response;
@@ -1126,7 +1150,9 @@ async function fetchWithBackoff(url, options, pacer) {
     // the base interval as soon as one request succeeds walks straight back
     // into the limiter on the next few conversations.
     pacer.intervalMs = Math.min(pacer.intervalMs * 2, MAX_PACER_INTERVAL_MS);
-    pacer.notBefore = Date.now() + delay;
+    // Never shorter than the interval just widened above: a `Retry-After: 0`
+    // would otherwise send the retry immediately and undo the slowdown.
+    pacer.notBefore = Date.now() + Math.max(delay, pacer.intervalMs);
   }
 }
 
@@ -1134,10 +1160,27 @@ async function fetchWithBackoff(url, options, pacer) {
 // the first write and a conversation disappears from the archive with no error
 // raised anywhere. Refuse the second write instead, so a duplicate surfaces at
 // the moment it happens rather than as a short ZIP.
+const zipWrittenPaths = new WeakMap();
+
 function addZipFile(zip, path, content) {
-  if (zip.file(path)) {
-    throw new Error(`Duplicate ZIP entry: ${path}`);
+  let written = zipWrittenPaths.get(zip);
+  if (!written) {
+    written = new Set();
+    zipWrittenPaths.set(zip, written);
   }
+
+  // Case-folded, because JSZip compares entry names case-sensitively but
+  // Windows and macOS filesystems do not: an archive holding both Main.py and
+  // main.py loses one of them on extraction, and nothing downstream can see
+  // that happen.
+  const key = path.toLowerCase();
+  if (written.has(key) || zip.file(path)) {
+    const error = new Error(`Duplicate ZIP entry: ${path}`);
+    error.duplicateZipEntry = true;
+    throw error;
+  }
+
+  written.add(key);
   zip.file(path, content);
 }
 
@@ -1199,6 +1242,7 @@ if (typeof module !== 'undefined' && module.exports) {
     importBackup,
     mergeStorageData,
     sanitizeForDiagnostics,
+    EXPORT_MANIFEST_BASENAME,
     EXPORT_MANIFEST_FILENAME,
     dedupeConversationNames,
     computeRetryDelay,

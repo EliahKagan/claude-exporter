@@ -896,7 +896,7 @@ async function exportAllFiltered() {
     // Collision-free names for every conversation, decided before the loop so
     // numbering does not depend on completion order.
     const safeNames = dedupeConversationNames(conversationsToExport, [
-      EXPORT_MANIFEST_FILENAME.replace(/\.json$/, '')
+      EXPORT_MANIFEST_BASENAME, EXPORT_MANIFEST_FILENAME
     ]);
 
     const pacer = createPacer(200);
@@ -1001,13 +1001,24 @@ async function exportAllFiltered() {
             }
           }
 
-          entry.status = 'exported';
+          if (entry.files.length === 0) {
+            // Reachable: chats disabled with neither artifact option selected
+            // writes nothing at all. Calling that "exported" would be a false
+            // success, and would deny the conversation a re-export later.
+            entry.status = 'skipped';
+            entry.reason = 'nothing to write for the selected options';
+          } else {
+            entry.status = 'exported';
+          }
           completed++;
 
         } catch (error) {
           console.error(`Failed to export ${conv.name}:`, error);
           entry.status = 'failed';
           entry.reason = error.message;
+          if (error.duplicateZipEntry) {
+            entry.duplicateZipEntry = true;
+          }
           failed++;
         }
       });
@@ -1022,8 +1033,10 @@ async function exportAllFiltered() {
     }
 
     const cancelledEarly = cancelExport;
-    const exportedCount = manifestEntries.filter(entry => entry.status === 'exported').length;
-    if (cancelledEarly && exportedCount === 0) {
+    // Only decides whether a cancelled run has anything worth packaging; the
+    // reported counts come from reconciledIds below.
+    const writtenCount = manifestEntries.filter(entry => entry.status === 'exported').length;
+    if (cancelledEarly && writtenCount === 0) {
       progressModal.style.display = 'none';
       showToast('Export cancelled — nothing had been exported yet.', true);
       return;
@@ -1032,6 +1045,8 @@ async function exportAllFiltered() {
     // Reconcile before anything is reported as exported: an entry only counts
     // if every file it claims is actually in the archive.
     const reconciliation = reconcileManifest(manifestEntries, zip);
+    const reconciledIds = exportedUuids(manifestEntries, reconciliation);
+    const duplicateEntries = manifestEntries.filter(entry => entry.duplicateZipEntry);
 
     for (const entry of manifestEntries) {
       if (entry.status === 'pending') {
@@ -1048,7 +1063,7 @@ async function exportAllFiltered() {
       cancelled: cancelledEarly,
       total,
       counts: {
-        exported: exportedCount,
+        exported: reconciledIds.length,
         skipped: manifestEntries.filter(entry => entry.status === 'skipped').length,
         failed: manifestEntries.filter(entry => entry.status === 'failed').length,
         cancelled: manifestEntries.filter(entry => entry.status === 'cancelled').length
@@ -1090,23 +1105,30 @@ async function exportAllFiltered() {
     // Record export timestamps only for conversations whose files are provably
     // in the archive, so a failed or clobbered conversation stays flagged as
     // new on the next run.
-    await saveExportTimestamps(exportedUuids(manifestEntries, reconciliation));
+    await saveExportTimestamps(reconciledIds);
     displayConversations();
     updateStats();
 
-    if (!reconciliation.ok) {
-      // Loud on purpose: this means the archive does not contain what the run
-      // just claimed it does, and a toast is too easy to miss.
+    if (!reconciliation.ok || duplicateEntries.length > 0) {
+      // Loud on purpose: either the archive does not contain what the run just
+      // claimed it does, or two conversations resolved to the same path and one
+      // lost its files. A toast is too easy to miss.
+      const problems = [];
+      if (!reconciliation.ok) {
+        problems.push(`${reconciliation.missing.length} conversation(s) are missing files from the ZIP`);
+      }
+      if (duplicateEntries.length > 0) {
+        problems.push(`${duplicateEntries.length} conversation(s) hit a duplicate ZIP path`);
+      }
       alert(
-        `Export integrity check FAILED for ${reconciliation.missing.length} conversation(s).\n\n` +
-        `Their files are missing from the ZIP. They have NOT been marked as exported, ` +
-        `so they will still show as new.\n\n` +
+        `Export integrity check FAILED.\n\n${problems.join('\n')}.\n\n` +
+        `They have NOT been marked as exported, so they will still show as new.\n\n` +
         `See ${EXPORT_MANIFEST_FILENAME} inside the ZIP for details.`
       );
     }
 
     if (cancelledEarly) {
-      showToast(`Export cancelled — partial ZIP with ${exportedCount} of ${total} conversations downloaded.`);
+      showToast(`Export cancelled — partial ZIP with ${reconciledIds.length} of ${total} conversations downloaded.`);
     } else if (failed > 0) {
       showToast(`Exported ${completed} of ${total} conversations (${failed} failed).`);
     } else {
