@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.10.20.1]
+
+- Bulk export hardening, across both the browse page "Export All" and the popup "Export All":
+  - Browse-page export is now strictly sequential (was three concurrent requests per batch).
+  - Added 429 handling, which did not exist anywhere before: `Retry-After` is honored when present, retries continue up to six attempts rather than giving up after one, and the request interval a 429 forces stays widened for the rest of the run instead of dropping back to the base delay. A 403 never backs off — on claude.ai it is usually a VPN artifact, not throttling. A network-level failure does not back off either, but it no longer resets the pacing, so losing connectivity mid-run cannot sprint through the remaining conversations.
+  - Conversations sharing a title no longer overwrite each other in the ZIP. Names are made collision-free before the export loop begins (so numbering does not depend on completion order) and compared case-insensitively, since a ZIP holds both `Recipe.md` and `recipe.md` but extracting it on Windows or macOS does not. Null, empty and whitespace-only titles fall back to the conversation UUID instead of producing a file called `.md`.
+  - Every ZIP write now refuses to overwrite an existing entry rather than letting JSZip silently replace it. The check ignores case, because JSZip does not but Windows and macOS filesystems do — an archive holding both `Main.py` and `main.py` loses one of them on extraction.
+  - Failure tracking is keyed by UUID instead of by conversation title. The popup path previously recorded failures by name and then matched them by UUID, so any *named* conversation that failed was recorded as successfully exported and hidden by the "New / Updated" filter on the next run — a silent data loss.
+  - Export timestamps are only written for conversations whose files are verified present in the archive. One consequence: conversations skipped by an artifacts-only export no longer get a timestamp, so they keep showing as new until a run actually exports them.
+  - The popup path now waits for the ZIP to finish generating before reporting success or recording timestamps; previously it started the download and abandoned the promise.
+- Bulk exports now include `export-manifest.json`, listing every conversation in the export set by UUID with its original title and either the filenames written or a skipped/failed status and reason. This is the failure summary README.md and docs/INSTALL.md already described, and it allows an export to be diffed against Claude's own data export by UUID.
+- Cancelling a bulk export now downloads a partial ZIP of the work already completed, named `...-partial-...`, instead of discarding all of it. Conversations never attempted are marked cancelled in the manifest and are not timestamped.
+
 ## [1.10.20]
 
 - Options page: wired up the donate links in the Contact & Diagnostics section — "Buy me a coffee" → [buymeacoffee.com/agoramachina](https://buymeacoffee.com/agoramachina), "Patreon" → [patreon.com/c/agoramachina](https://www.patreon.com/c/agoramachina). Both open in a new tab with `rel="noopener noreferrer"`.
