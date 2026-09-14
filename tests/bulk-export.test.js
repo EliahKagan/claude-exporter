@@ -83,6 +83,88 @@ describe('dedupeConversationNames', () => {
     expect(names.get('u2')).toBe('doc_2');
   });
 
+  it('protects a real doc_1 when the case variance is on the duplicate side', () => {
+    const names = dedupeConversationNames([
+      conv('u1', 'Doc'), conv('u2', 'Doc'), conv('u3', 'doc_1'),
+    ]);
+    expect(names.get('u3')).toBe('doc_1');
+    expect(names.get('u2')).toBe('Doc_2');
+  });
+
+  it('protects an owner whose title only matches after sanitizing', () => {
+    // The literals pass must use the sanitized name, or the two passes are
+    // working in different namespaces.
+    const names = dedupeConversationNames([
+      conv('u1', 'doc'), conv('u2', 'doc'), conv('u3', 'doc/1'),
+    ]);
+    expect(names.get('u3')).toBe('doc_1');
+    expect(names.get('u2')).toBe('doc_2');
+  });
+
+  it('protects an owner whose name comes from the UUID fallback', () => {
+    const names = dedupeConversationNames([
+      conv('u1', 'doc'), conv('u2', 'doc'), conv('doc_1', null),
+    ]);
+    expect(names.get('doc_1')).toBe('doc_1');
+    expect(names.get('u2')).toBe('doc_2');
+  });
+
+  it('renames rather than failing when folding merges two distinct names', () => {
+    // Upper-casing merges the fi ligature with "fi". Over-merging is safe
+    // precisely because the dedup renames; nothing is refused later.
+    const ligature = String.fromCharCode(0xfb01);
+    const names = dedupeConversationNames([conv('u1', ligature + 'le'), conv('u2', 'file')]);
+    expect(names.get('u1')).not.toBe(names.get('u2'));
+    const zip = new JSZip();
+    addZipFile(zip, `${names.get('u1')}.md`, 'a');
+    expect(() => addZipFile(zip, `${names.get('u2')}.md`, 'b')).not.toThrow();
+  });
+
+  it('is not defeated by Final_Sigma when an extension is appended', () => {
+    // toLowerCase keys a trailing sigma differently from the same sigma
+    // followed by ".md", so the dedup (bare name) and the ZIP guard (full path)
+    // disagreed and the loser failed on every run forever.
+    const capitalSigma = String.fromCharCode(0x3a3);
+    const smallSigma = String.fromCharCode(0x3c3);
+    const stem = 'O' + String.fromCharCode(0x394) + 'O';
+    const names = dedupeConversationNames([
+      conv('u1', stem + capitalSigma), conv('u2', stem + smallSigma),
+    ]);
+    const zip = new JSZip();
+    addZipFile(zip, `${names.get('u1')}.md`, 'a');
+    expect(() => addZipFile(zip, `${names.get('u2')}.md`, 'b')).not.toThrow();
+  });
+
+  it.each([
+    ['long s', 's', String.fromCharCode(0x17f)],
+    ['micro sign', String.fromCharCode(0xb5), String.fromCharCode(0x3bc)],
+    ['final sigma', String.fromCharCode(0x3c3), String.fromCharCode(0x3c2)],
+    ['beta symbol', String.fromCharCode(0x3b2), String.fromCharCode(0x3d0)],
+    ['st ligature', String.fromCharCode(0xfb05), String.fromCharCode(0xfb06)],
+  ])('treats %s variants as colliding, as a case-insensitive filesystem does', (_label, a, b) => {
+    const names = dedupeConversationNames([conv('u1', a), conv('u2', b)]);
+    expect(names.get('u1')).not.toBe(names.get('u2'));
+  });
+
+  it('caps a name so one long title cannot abort the whole extraction', () => {
+    const names = dedupeConversationNames([conv('u1', 'x'.repeat(400))]);
+    expect([...names.get('u1')].length).toBeLessThanOrEqual(120);
+  });
+
+  it('does not split a surrogate pair when capping', () => {
+    const names = dedupeConversationNames([conv('u1', String.fromCodePoint(0x1f600).repeat(400))]);
+    const capped = names.get('u1');
+    expect(capped).toBe([...capped].join(''));
+    expect([...capped].length).toBeLessThanOrEqual(120);
+  });
+
+  it('still separates two over-long titles that share a prefix', () => {
+    const names = dedupeConversationNames([
+      conv('u1', 'y'.repeat(300) + 'A'), conv('u2', 'y'.repeat(300) + 'B'),
+    ]);
+    expect(names.get('u1')).not.toBe(names.get('u2'));
+  });
+
   it('treats NFC and NFD spellings of a title as colliding', () => {
     // macOS normalizes filenames, so these are one file after extraction.
     const combiningAcute = String.fromCharCode(0x301);
@@ -158,9 +240,10 @@ describe('dedupeConversationNames', () => {
     const conversations = Array.from({ length: 1000 }, (_, i) =>
       conv(`u${i}`, ['same', 'SAME', '', null, `doc_${i % 7}`][i % 5]));
     const names = dedupeConversationNames(conversations);
-    expect(names.size).toBe(conversations.length);
-    const lowered = [...names.values()].map(n => n.toLowerCase());
-    expect(new Set(lowered).size).toBe(conversations.length);
+    // names.size is tautological (the Map is keyed by distinct UUIDs); the
+    // content is that no two assigned names collide on a folding filesystem.
+    const keys = [...names.values()].map(n => n.normalize('NFC').toUpperCase());
+    expect(new Set(keys).size).toBe(conversations.length);
   });
 });
 
@@ -186,8 +269,22 @@ describe('computeRetryDelay', () => {
 
   it('does not treat an absent header as zero delay', () => {
     // Number(null) is 0, which would make the retry immediate.
-    expect(computeRetryDelay(429, null, 0)).toBeGreaterThan(0);
-    expect(computeRetryDelay(429, '', 0)).toBeGreaterThan(0);
+    expect(computeRetryDelay(429, null, 0)).toBe(1000);
+    expect(computeRetryDelay(429, '', 0)).toBe(1000);
+  });
+
+  it('rejects a header with trailing junk rather than producing NaN', () => {
+    // /^\d+/ instead of /^\d+$/ would match "5 seconds", and Number("5 seconds")
+    // is NaN, which collapses the wait to nothing.
+    expect(computeRetryDelay(429, '5 seconds', 0)).toBe(1000);
+  });
+
+  it('tolerates a padded header', () => {
+    expect(computeRetryDelay(429, ' 5 ', 0)).toBe(5000);
+  });
+
+  it('rejects a negative header', () => {
+    expect(computeRetryDelay(429, '-5', 0)).toBe(1000);
   });
 
   it('caps a very large Retry-After', () => {
@@ -361,16 +458,6 @@ describe('fetchWithBackoff', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it('is uncancelled by default, so other callers are unaffected', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(response(200));
-    vi.stubGlobal('fetch', fetchMock);
-
-    const res = await run(fetchWithBackoff('u', {}, createPacer(200)));
-
-    expect(res.status).toBe(200);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-  });
-
   it('does not spin forever when the pacer deadline is NaN', async () => {
     // `NaN <= 0` is false, so a naive comparison never breaks out and
     // setTimeout(fn, NaN) fires immediately — a hot loop that never fetches.
@@ -381,6 +468,20 @@ describe('fetchWithBackoff', () => {
 
     expect(res.status).toBe(200);
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns a 5xx immediately without entering the retry path', async () => {
+    // Pins fetchWithBackoff's own status routing, not just computeRetryDelay:
+    // a widened comparison would let a 500 into the retry block.
+    const pacer = createPacer(200);
+    const fetchMock = vi.fn().mockResolvedValue(response(503, '60'));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const res = await run(fetchWithBackoff('u', {}, pacer));
+
+    expect(res.status).toBe(503);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(pacer.notBefore).toBe(Date.now() + 200);
   });
 
   it('does not retry a 403', async () => {
@@ -512,6 +613,12 @@ describe('fetchWithBackoff', () => {
   });
 });
 
+describe('createPacer', () => {
+  it('starts with no deadline, so the first request is not delayed', () => {
+    expect(createPacer(200)).toEqual({ intervalMs: 200, notBefore: 0 });
+  });
+});
+
 describe('addZipFile', () => {
   it('writes a file that is not already present', async () => {
     const zip = new JSZip();
@@ -581,6 +688,18 @@ describe('addZipFile', () => {
     }
   });
 
+  it('catches a case variant of an entry written directly with zip.file', () => {
+    const zip = new JSZip();
+    zip.file('Chats/A.md', 'written outside the helper');
+    expect(() => addZipFile(zip, 'Chats/a.md', 'x')).toThrow(/Duplicate ZIP entry/);
+  });
+
+  it('catches an exact duplicate of an entry written directly with zip.file', () => {
+    const zip = new JSZip();
+    zip.file('a.md', 'raw');
+    expect(() => addZipFile(zip, 'a.md', 'x')).toThrow(/Duplicate ZIP entry/);
+  });
+
   it('keeps its written-path index per ZIP, not globally', () => {
     const first = new JSZip();
     const second = new JSZip();
@@ -628,6 +747,32 @@ describe('extractArtifactFiles filename dedup', () => {
     expect(new Set(names.map(n => n.normalize('NFC').toLowerCase())).size).toBe(2);
   });
 
+  it('assigns the exact deduplicated names, not merely distinct ones', () => {
+    expect(namesFor('Main.py', 'main.py', 'MAIN.py')).toEqual(['Main.py', 'main_1.py', 'MAIN_2.py']);
+  });
+
+  it('keeps the original extension when deduplicating a dotted name', () => {
+    expect(namesFor('My.Data.V2.py', 'my.data.v2.py')).toEqual(['My.Data.V2.py', 'my.data.v2_1.py']);
+  });
+
+  it('deduplicates across messages, not just within one', () => {
+    const data = {
+      name: 'Conv', uuid: 'u1', current_leaf_message_uuid: 'm3',
+      chat_messages: [
+        { uuid: 'm1', sender: 'human', parent_message_uuid: '00000000-0000-0000-0000-000000000000', content: [] },
+        { uuid: 'm2', sender: 'assistant', parent_message_uuid: 'm1', content: [artifact('Main.py')] },
+        { uuid: 'm3', sender: 'assistant', parent_message_uuid: 'm2', content: [artifact('Main.py')] },
+      ],
+    };
+    const names = extractArtifactFiles(data, 'original').map(a => a.filename);
+    expect(names).toEqual(['Main.py', 'Main_1.py']);
+  });
+
+  it('starts each conversation with a clean namespace', () => {
+    expect(namesFor('Main.py')).toEqual(['Main.py']);
+    expect(namesFor('Main.py')).toEqual(['Main.py']);
+  });
+
   it('produces names that addZipFile will accept together', () => {
     const zip = new JSZip();
     for (const name of namesFor('Main.py', 'main.py', 'MAIN.py')) {
@@ -671,6 +816,29 @@ describe('reconcileManifest', () => {
       entry({ uuid: 'u2', files: ['Recipe.md'] }),
     ];
     expect(reconcileManifest(entries, zip).ok).toBe(true);
+  });
+
+  it('reports an exported entry with no files property at all', () => {
+    const result = reconcileManifest([{ uuid: 'u1', title: 'T', status: 'exported' }], new JSZip());
+    expect(result.ok).toBe(false);
+    expect(result.missing[0].reason).toMatch(/wrote no files/);
+  });
+
+  it('checks every claimed path, not only the last', () => {
+    const zip = new JSZip();
+    zip.file('present.md', 'x');
+    const result = reconcileManifest([entry({ files: ['missing.md', 'present.md'] })], zip);
+    expect(result.ok).toBe(false);
+    expect(result.missing[0].reason).toContain('missing.md');
+  });
+
+  it('fires when an entry claims the same path twice', () => {
+    // Three claimed paths that are one archive entry is not three files.
+    const zip = new JSZip();
+    zip.file('only.md', 'x');
+    const result = reconcileManifest([entry({ files: ['only.md', 'only.md'] })], zip);
+    expect(result.ok).toBe(false);
+    expect(result.missing[0].reason).toMatch(/same path more than once/);
   });
 
   it('fires when an entry claims success but recorded no files', () => {
@@ -735,12 +903,16 @@ describe('exportedUuids', () => {
       { uuid: 'uuid-2', title: 'Other', status: 'exported', files: ['Other.md'] },
     ];
     expect(exportedUuids(entries, clean)).toEqual(['uuid-2']);
-    expect(exportedUuids(entries, clean)).not.toContain('uuid-1');
   });
 
   it('does not record an unnamed conversation that failed as exported', () => {
     const entries = [{ uuid: 'uuid-1', title: null, status: 'failed', reason: 'HTTP 500', files: [] }];
     expect(exportedUuids(entries, clean)).toEqual([]);
+  });
+
+  it('tolerates a reconciliation object with no missing list', () => {
+    const entries = [{ uuid: 'u1', status: 'exported', files: ['a.md'] }];
+    expect(exportedUuids(entries, { ok: true })).toEqual(['u1']);
   });
 
   it('does not record a skipped conversation as exported', () => {

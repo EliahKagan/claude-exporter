@@ -462,7 +462,7 @@ function getFileExtension(language) {
     gradle: '.gradle',
     groovy: '.groovy',
   };
-  return languageToExt[language.toLowerCase()] || '.txt';
+  return languageToExt[String(language || '').toLowerCase()] || '.txt';
 }
 
 // Check if a language is a programming language (should be saved in original format only)
@@ -568,7 +568,26 @@ function convertArtifactFormat(content, language, baseFilename, format) {
 // one on extraction. Every place that decides whether two names collide must
 // use this, or the producers and the guard disagree.
 function filenameKey(name) {
-  return name.normalize('NFC').toLowerCase();
+  // toUpperCase, not toLowerCase: lowercasing applies Unicode's Final_Sigma
+  // context rule, so a name ending in a sigma keys differently on its own than
+  // it does once an extension is appended. The conversation dedup keys a bare
+  // name and the ZIP guard keys a full path, so that made them disagree and a
+  // conversation could fail on every run forever. Upper-casing has no such
+  // context rule, and it merges 20 of the 21 BMP groups that collapse on a
+  // case-insensitive filesystem but survive lowercasing. Over-merging is the
+  // safe direction: it renames, it never silently combines two conversations.
+  return name.normalize('NFC').toUpperCase();
+}
+
+// Per-component cap. APFS and NTFS reject components over 255 characters, and
+// ditto aborts the whole extraction when it hits one, so an over-long name
+// takes unrelated conversations down with it. Flat mode joins two capped names
+// into one path, hence a cap comfortably under half the limit.
+const MAX_NAME_CHARS = 120;
+
+function capNameLength(name) {
+  const chars = [...name];   // by code point, so a surrogate pair is never split
+  return chars.length <= MAX_NAME_CHARS ? name : chars.slice(0, MAX_NAME_CHARS).join('');
 }
 
 // Extract all artifacts from a conversation into separate files
@@ -586,7 +605,7 @@ function extractArtifactFiles(data, artifactFormat = 'original') {
       // Generate filename from title and language
       let baseFilename = artifact.title || 'artifact';
       // Sanitize filename (remove invalid characters)
-      baseFilename = baseFilename.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_');
+      baseFilename = capNameLength(baseFilename.replace(/[<>:"/\\|?*\x00-\x1f\x7f]/g, '_'));
 
       // Convert artifact based on selected format
       const converted = convertArtifactFormat(
@@ -1071,7 +1090,7 @@ function dedupeConversationNames(conversations, reservedNames = []) {
   // producing a file called ".md".
   const sanitize = (conv) => {
     const title = (conv.name || '').trim();
-    const cleaned = (title || conv.uuid).replace(/[<>:"/\\|?*\x00-\x1f]/g, '_');
+    const cleaned = capNameLength((title || conv.uuid).replace(/[<>:"/\\|?*\x00-\x1f\x7f]/g, '_'));
     // "." and ".." are path segments, not names: as a nested-export folder they
     // produce entries like "./x" or "../x", which collide with a root entry or
     // escape the extraction directory once an unzip tool normalizes them.
@@ -1201,7 +1220,10 @@ const zipWrittenPaths = new WeakMap();
 function addZipFile(zip, path, content) {
   let written = zipWrittenPaths.get(zip);
   if (!written) {
-    written = new Set();
+    // Seeded from whatever is already in the archive, so entries written
+    // directly with zip.file are covered by the same folded comparison rather
+    // than only by the exact-match cross-check below.
+    written = new Set(Object.keys(zip.files).filter(name => !zip.files[name].dir).map(filenameKey));
     zipWrittenPaths.set(zip, written);
   }
 
@@ -1232,6 +1254,11 @@ function reconcileManifest(entries, zip) {
     const files = entry.files || [];
     if (files.length === 0) {
       missing.push({ uuid: entry.uuid, title: entry.title, reason: 'marked exported but wrote no files' });
+      continue;
+    }
+
+    if (new Set(files.map(filenameKey)).size !== files.length) {
+      missing.push({ uuid: entry.uuid, title: entry.title, reason: 'claims the same path more than once' });
       continue;
     }
 
