@@ -905,139 +905,133 @@ async function exportAllFiltered() {
 
     // One conversation at a time: concurrent requests are what trips the API
     // rate limiter on large exports.
-    const batchSize = 1;
-    for (let i = 0; i < total; i += batchSize) {
+    for (const conv of conversationsToExport) {
       if (cancelExport) break;
 
-      const batch = conversationsToExport.slice(i, Math.min(i + batchSize, total));
-      const promises = batch.map(async (conv) => {
-        const entry = manifestByUuid.get(conv.uuid);
-        try {
-          const response = await fetchWithBackoff(
-            `https://claude.ai/api/organizations/${orgId}/chat_conversations/${conv.uuid}?tree=True&rendering_mode=messages&render_all_tools=true`,
-            {
-              credentials: 'include',
-              headers: {
-                'Accept': 'application/json',
-              }
-            },
-            pacer,
-            () => cancelExport
-          );
-
-          if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
-          }
-
-          const data = await response.json();
-
-          // Infer model if null
-          data.model = inferModel(data);
-
-          // Extract artifacts first to check if this conversation should be included
-          const artifactFiles = extractArtifactFiles(data, artifactFormat);
-
-          // If chats are disabled and no artifacts, skip this conversation
-          if (includeChats === false && artifactFiles.length === 0) {
-            console.log(`Skipping ${conv.name} - no artifacts found (chats disabled)`);
-            entry.status = 'skipped';
-            entry.reason = 'no artifacts found (chats disabled)';
-            completed++; // Count as completed even though skipped
-            return; // Skip this conversation in the promise
-          }
-
-          // Generate filename and content based on format
-          let content, filename;
-          const safeName = safeNames.get(conv.uuid);
-
-          switch (format) {
-            case 'markdown':
-              content = convertToMarkdown(data, includeMetadata, conv.uuid, includeArtifacts, includeThinking);
-              filename = `${safeName}.md`;
-              break;
-            case 'text':
-              content = convertToText(data, includeMetadata, includeArtifacts, includeThinking);
-              filename = `${safeName}.txt`;
-              break;
-            default: // json
-              content = JSON.stringify(data, null, 2);
-              filename = `${safeName}.json`;
-          }
-
-          // Every write goes through addZipFile with a full root-relative path,
-          // so the manifest records exactly the path that was written.
-          const writeFile = (path, body) => {
-            addZipFile(zip, path, body);
-            entry.files.push(path);
-          };
-
-          // Flat export: use Chats and Artifacts top-level folders
-          if (flattenArtifacts && !extractArtifacts) {
-            // Add chat file to Chats folder if chats are enabled
-            if (includeChats !== false) {
-              writeFile(`Chats/${filename}`, content);
+      const entry = manifestByUuid.get(conv.uuid);
+      try {
+        const response = await fetchWithBackoff(
+          `https://claude.ai/api/organizations/${orgId}/chat_conversations/${conv.uuid}?tree=True&rendering_mode=messages&render_all_tools=true`,
+          {
+            credentials: 'include',
+            headers: {
+              'Accept': 'application/json',
             }
+          },
+          pacer,
+          () => cancelExport
+        );
 
-            // Add artifacts to Artifacts folder with conversation name prefix
-            for (const artifact of artifactFiles) {
-              writeFile(`Artifacts/${safeName}_${artifact.filename}`, artifact.content);
-            }
-          }
-          // Nested export: create per-conversation folders with artifacts subfolder
-          else if (extractArtifacts) {
-            // Add conversation file only if includeChats is true
-            if (includeChats !== false) {
-              writeFile(`${safeName}/${filename}`, content);
-            }
-
-            // Add artifact files in nested artifacts subfolder
-            const artifactPrefix = includeChats !== false ? `${safeName}/artifacts/` : `${safeName}/`;
-            for (const artifact of artifactFiles) {
-              writeFile(`${artifactPrefix}${artifact.filename}`, artifact.content);
-            }
-          } else {
-            // No artifact extraction - add file to ZIP root only if chats are enabled
-            if (includeChats !== false) {
-              writeFile(filename, content);
-            }
-          }
-
-          if (entry.files.length === 0) {
-            // Reachable: chats disabled with neither artifact option selected
-            // writes nothing at all. Calling that "exported" would be a false
-            // success, and would deny the conversation a re-export later.
-            entry.status = 'skipped';
-            entry.reason = 'nothing to write for the selected options';
-          } else {
-            entry.status = 'exported';
-          }
-          completed++;
-
-        } catch (error) {
-          if (error.exportCancelled) {
-            // Interrupted mid-request by the Cancel button; nothing was written
-            // for this conversation, so it must stay flagged as new.
-            entry.status = 'cancelled';
-            entry.reason = 'export cancelled during this conversation';
-            return;
-          }
-          console.error(`Failed to export ${conv.name}:`, error);
-          entry.status = 'failed';
-          entry.reason = error.message;
-          if (error.duplicateZipEntry) {
-            entry.duplicateZipEntry = true;
-          }
-          failed++;
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
         }
-      });
 
-      // Wait for batch to complete
-      await Promise.all(promises);
+        const data = await response.json();
 
-      // Update progress
-      const progress = Math.round((completed + failed) / total * 100);
-      progressBar.style.width = `${progress}%`;
-      progressStats.textContent = `${completed} succeeded, ${failed} failed out of ${total}`;
+        // Infer model if null
+        data.model = inferModel(data);
+
+        // Extract artifacts first to check if this conversation should be included
+        const artifactFiles = extractArtifactFiles(data, artifactFormat);
+
+        // If chats are disabled and no artifacts, skip this conversation
+        if (includeChats === false && artifactFiles.length === 0) {
+          console.log(`Skipping ${conv.name} - no artifacts found (chats disabled)`);
+          entry.status = 'skipped';
+          entry.reason = 'no artifacts found (chats disabled)';
+          completed++; // Count as completed even though skipped
+          continue;
+        }
+
+        // Generate filename and content based on format
+        let content, filename;
+        const safeName = safeNames.get(conv.uuid);
+
+        switch (format) {
+          case 'markdown':
+            content = convertToMarkdown(data, includeMetadata, conv.uuid, includeArtifacts, includeThinking);
+            filename = `${safeName}.md`;
+            break;
+          case 'text':
+            content = convertToText(data, includeMetadata, includeArtifacts, includeThinking);
+            filename = `${safeName}.txt`;
+            break;
+          default: // json
+            content = JSON.stringify(data, null, 2);
+            filename = `${safeName}.json`;
+        }
+
+        // Every write goes through addZipFile with a full root-relative path,
+        // so the manifest records exactly the path that was written.
+        const writeFile = (path, body) => {
+          addZipFile(zip, path, body);
+          entry.files.push(path);
+        };
+
+        // Flat export: use Chats and Artifacts top-level folders
+        if (flattenArtifacts && !extractArtifacts) {
+          // Add chat file to Chats folder if chats are enabled
+          if (includeChats !== false) {
+            writeFile(`Chats/${filename}`, content);
+          }
+
+          // Add artifacts to Artifacts folder with conversation name prefix
+          for (const artifact of artifactFiles) {
+            writeFile(`Artifacts/${safeName}_${artifact.filename}`, artifact.content);
+          }
+        }
+        // Nested export: create per-conversation folders with artifacts subfolder
+        else if (extractArtifacts) {
+          // Add conversation file only if includeChats is true
+          if (includeChats !== false) {
+            writeFile(`${safeName}/${filename}`, content);
+          }
+
+          // Add artifact files in nested artifacts subfolder
+          const artifactPrefix = includeChats !== false ? `${safeName}/artifacts/` : `${safeName}/`;
+          for (const artifact of artifactFiles) {
+            writeFile(`${artifactPrefix}${artifact.filename}`, artifact.content);
+          }
+        } else {
+          // No artifact extraction - add file to ZIP root only if chats are enabled
+          if (includeChats !== false) {
+            writeFile(filename, content);
+          }
+        }
+
+        if (entry.files.length === 0) {
+          // Reachable: chats disabled with neither artifact option selected
+          // writes nothing at all. Calling that "exported" would be a false
+          // success, and would deny the conversation a re-export later.
+          entry.status = 'skipped';
+          entry.reason = 'nothing to write for the selected options';
+        } else {
+          entry.status = 'exported';
+        }
+        completed++;
+
+      } catch (error) {
+        if (error.exportCancelled) {
+          // Interrupted mid-request by the Cancel button; nothing was written
+          // for this conversation, so it must stay flagged as new.
+          entry.status = 'cancelled';
+          entry.reason = 'export cancelled during this conversation';
+          continue;
+        }
+        console.error(`Failed to export ${conv.name}:`, error);
+        entry.status = 'failed';
+        entry.reason = error.message;
+        if (error.duplicateZipEntry) {
+          entry.duplicateZipEntry = true;
+        }
+        failed++;
+      } finally {
+        // Runs for every conversation, including the skip and cancel paths,
+        // which leave the try block early.
+        const progress = Math.round((completed + failed) / total * 100);
+        progressBar.style.width = `${progress}%`;
+        progressStats.textContent = `${completed} succeeded, ${failed} failed out of ${total}`;
+      }
     }
 
     const cancelledEarly = cancelExport;
@@ -1056,10 +1050,12 @@ async function exportAllFiltered() {
     const reconciledIds = exportedUuids(manifestEntries, reconciliation);
     const duplicateEntries = manifestEntries.filter(entry => entry.duplicateZipEntry);
 
-    for (const entry of manifestEntries) {
-      if (entry.status === 'pending') {
-        entry.status = 'cancelled';
-        entry.reason = 'export cancelled before this conversation was attempted';
+    if (cancelledEarly) {
+      for (const entry of manifestEntries) {
+        if (entry.status === 'pending') {
+          entry.status = 'cancelled';
+          entry.reason = 'export cancelled before this conversation was attempted';
+        }
       }
     }
 
@@ -1070,11 +1066,16 @@ async function exportAllFiltered() {
       generatedAt: new Date().toISOString(),
       cancelled: cancelledEarly,
       total,
+      // Every conversation lands in exactly one bucket, so these sum to total.
+      // A non-zero `pending` on a run that was not cancelled means a
+      // conversation was never attempted, which would be a bug.
       counts: {
         exported: reconciledIds.length,
+        unreconciled: reconciliation.missing.length,
         skipped: manifestEntries.filter(entry => entry.status === 'skipped').length,
         failed: manifestEntries.filter(entry => entry.status === 'failed').length,
-        cancelled: manifestEntries.filter(entry => entry.status === 'cancelled').length
+        cancelled: manifestEntries.filter(entry => entry.status === 'cancelled').length,
+        pending: manifestEntries.filter(entry => entry.status === 'pending').length
       },
       reconciliation,
       conversations: manifestEntries
