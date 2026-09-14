@@ -108,9 +108,9 @@
 ### Low Priority 🟢
 
 - **True cancellation of in-flight bulk export fetches**
-  - Cancel button currently hides the modal immediately, but in-flight batch fetches still run in the background until they finish
-  - Wire up an `AbortController` so the actual `fetch()` calls and ZIP work get aborted on cancel
-  - Mostly cosmetic — saves a few seconds of wasted bandwidth + CPU per cancel
+  - Partly addressed: Cancel now keeps the modal up, packages a partial ZIP of whatever completed, and interrupts a pending rate-limit backoff instead of sleeping it out
+  - Still outstanding: no `AbortController`, so a request already in flight runs to completion, and there is no per-request timeout — one hung socket can stall a long run indefinitely
+  - No longer cosmetic at scale: a 2000+ conversation export makes a stalled request expensive
 
 - **In-popup changelog / "What's new"**
   - Link to summary of changes on version bump

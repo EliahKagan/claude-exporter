@@ -12,6 +12,13 @@
   - The popup path now waits for the ZIP to finish generating before reporting success or recording timestamps; previously it started the download and abandoned the promise.
 - Bulk exports now include `export-manifest.json`, listing every conversation in the export set by UUID with its original title and either the filenames written or a skipped/failed status and reason. This is the failure summary README.md and docs/INSTALL.md already described, and it allows an export to be diffed against Claude's own data export by UUID.
 - Cancelling a bulk export now downloads a partial ZIP of the work already completed, named `...-partial-...`, instead of discarding all of it. Conversations never attempted are marked cancelled in the manifest and are not timestamped.
+- Cancelling also interrupts a pending rate-limit backoff rather than sleeping it out; with a `Retry-After: 60` in effect the button previously appeared dead for up to six minutes. A request already in flight still runs to completion.
+- Filename collision handling now folds case *and* Unicode normalization, in the conversation-name dedup, the artifact-filename dedup, and the ZIP write guard. These previously disagreed: artifact filenames were deduplicated case-sensitively while the ZIP guard was case-insensitive, so a conversation containing both `Main.py` and `main.py` failed on every run and could never be exported. macOS is normalization-insensitive, so the NFC and NFD spellings of a name are one file after extraction.
+- Control characters are stripped from conversation and artifact filenames; they were not in the `<>:"/\|?*` set.
+- Conversation titles consisting only of dots fall back to the UUID. As a nested-export folder, `.` collided with the archive root and `..` escaped the extraction directory.
+- Reported counts come from what actually reconciled, not from what was processed. The success toast previously counted skipped conversations, so an artifacts-only run could claim full success having recorded no exports at all.
+- `export-manifest.json` gained `unreconciled` and `pending` count buckets, and both export paths now write the same manifest schema.
+- A 429 that exhausts its retry budget still applies the server's `Retry-After` to the next request instead of discarding it.
 
 ## [1.10.20]
 
