@@ -562,6 +562,15 @@ function convertArtifactFormat(content, language, baseFilename, format) {
   }
 }
 
+// Filesystem-equivalence key for a file or path name. Windows and macOS treat
+// names differing only in case as the same file, and macOS also normalizes
+// Unicode, so two archive entries differing only in those ways collapse into
+// one on extraction. Every place that decides whether two names collide must
+// use this, or the producers and the guard disagree.
+function filenameKey(name) {
+  return name.normalize('NFC').toLowerCase();
+}
+
 // Extract all artifacts from a conversation into separate files
 function extractArtifactFiles(data, artifactFormat = 'original') {
   const artifactFiles = [];
@@ -577,7 +586,7 @@ function extractArtifactFiles(data, artifactFormat = 'original') {
       // Generate filename from title and language
       let baseFilename = artifact.title || 'artifact';
       // Sanitize filename (remove invalid characters)
-      baseFilename = baseFilename.replace(/[<>:"/\\|?*]/g, '_');
+      baseFilename = baseFilename.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_');
 
       // Convert artifact based on selected format
       const converted = convertArtifactFormat(
@@ -595,12 +604,12 @@ function extractArtifactFiles(data, artifactFormat = 'original') {
       const extension = extensionMatch ? extensionMatch[1] : '';
       const nameWithoutExt = extension ? filename.slice(0, -extension.length) : filename;
 
-      while (usedFilenames.has(filename)) {
+      while (usedFilenames.has(filenameKey(filename))) {
         filename = `${nameWithoutExt}_${counter}${extension}`;
         counter++;
       }
 
-      usedFilenames.add(filename);
+      usedFilenames.add(filenameKey(filename));
 
       artifactFiles.push({
         filename: filename,
@@ -1062,36 +1071,39 @@ function dedupeConversationNames(conversations, reservedNames = []) {
   // producing a file called ".md".
   const sanitize = (conv) => {
     const title = (conv.name || '').trim();
-    const cleaned = (title || conv.uuid).replace(/[<>:"/\\|?*]/g, '_');
+    const cleaned = (title || conv.uuid).replace(/[<>:"/\\|?*\x00-\x1f]/g, '_');
     // "." and ".." are path segments, not names: as a nested-export folder they
     // produce entries like "./x" or "../x", which collide with a root entry or
     // escape the extraction directory once an unzip tool normalizes them.
     return /^\.+$/.test(cleaned) ? conv.uuid : cleaned;
   };
 
-  // Pass 1: every name a conversation could claim on its own merits. A
-  // deduplicated "doc" must skip past a conversation genuinely titled "doc_1"
-  // rather than take its slot; without this pass the outcome depends on the
-  // order the conversations happen to arrive in.
-  const literals = new Set(reservedNames.map(name => name.toLowerCase()));
+  // Pass 1: every name a conversation could claim on its own merits, so a
+  // deduplicated "doc" skips past a conversation genuinely titled "doc_1"
+  // rather than taking its slot. Single-pass assignment is deterministic too;
+  // what this buys is that the rightful owner keeps its name whatever order
+  // the conversations arrive in.
+  // Reserved names are not seeded here: `taken` already holds them and is
+  // checked first, so a literal entry for them could never decide anything.
+  const literals = new Set();
   for (const conv of conversations) {
-    literals.add(sanitize(conv).toLowerCase());
+    literals.add(filenameKey(sanitize(conv)));
   }
 
-  const taken = new Set(reservedNames.map(name => name.toLowerCase()));
+  const taken = new Set(reservedNames.map(filenameKey));
   const assigned = new Map();
 
   for (const conv of conversations) {
     const base = sanitize(conv);
     let name = base;
     let counter = 1;
-    while (taken.has(name.toLowerCase()) ||
-           (name !== base && literals.has(name.toLowerCase()))) {
+    while (taken.has(filenameKey(name)) ||
+           (name !== base && literals.has(filenameKey(name)))) {
       name = `${base}_${counter}`;
       counter++;
     }
 
-    taken.add(name.toLowerCase());
+    taken.add(filenameKey(name));
     assigned.set(conv.uuid, name);
   }
 
@@ -1138,7 +1150,7 @@ async function fetchWithBackoff(url, options, pacer, isCancelled = () => false) 
     // package the conversations it already has.
     while (!isCancelled()) {
       const waitMs = pacer.notBefore - Date.now();
-      if (waitMs <= 0) break;
+      if (!(waitMs > 0)) break;   // also breaks on NaN, which would spin forever
       await new Promise(resolve => setTimeout(resolve, Math.min(waitMs, CANCEL_POLL_MS)));
     }
     if (isCancelled()) {
@@ -1193,11 +1205,11 @@ function addZipFile(zip, path, content) {
     zipWrittenPaths.set(zip, written);
   }
 
-  // Case-folded, because JSZip compares entry names case-sensitively but
-  // Windows and macOS filesystems do not: an archive holding both Main.py and
-  // main.py loses one of them on extraction, and nothing downstream can see
-  // that happen.
-  const key = path.toLowerCase();
+  // Keyed by filesystem equivalence, not by exact bytes: JSZip compares entry
+  // names exactly, but an archive holding both Main.py and main.py — or the
+  // NFC and NFD spellings of one name — loses one of them on extraction, and
+  // nothing downstream can see that happen.
+  const key = filenameKey(path);
   if (written.has(key) || zip.file(path)) {
     const error = new Error(`Duplicate ZIP entry: ${path}`);
     error.duplicateZipEntry = true;
@@ -1274,6 +1286,7 @@ if (typeof module !== 'undefined' && module.exports) {
     fetchWithBackoff,
     addZipFile,
     reconcileManifest,
+    filenameKey,
     exportedUuids,
   };
 }

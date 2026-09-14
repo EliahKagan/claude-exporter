@@ -15,6 +15,7 @@ const {
   createPacer,
   fetchWithBackoff,
   addZipFile,
+  extractArtifactFiles,
   reconcileManifest,
   exportedUuids,
 } = require('../chrome/utils.js');
@@ -72,6 +73,31 @@ describe('dedupeConversationNames', () => {
     expect(names.get('uuid-abc')).toBe('uuid-abc');
   });
 
+  it('protects a real Doc_1 whose case differs from the duplicate', () => {
+    // The lowercase-only variant of this test passes even if the literals pass
+    // forgets to case-fold, so it never exercised that folding.
+    const names = dedupeConversationNames([
+      conv('u1', 'doc'), conv('u2', 'doc'), conv('u3', 'Doc_1'),
+    ]);
+    expect(names.get('u3')).toBe('Doc_1');
+    expect(names.get('u2')).toBe('doc_2');
+  });
+
+  it('treats NFC and NFD spellings of a title as colliding', () => {
+    // macOS normalizes filenames, so these are one file after extraction.
+    const combiningAcute = String.fromCharCode(0x301);
+    const base = 'Cafe' + combiningAcute + ' notes';
+    const names = dedupeConversationNames([
+      conv('u1', base.normalize('NFC')), conv('u2', base.normalize('NFD')),
+    ]);
+    expect(names.get('u1')).not.toBe(names.get('u2'));
+  });
+
+  it('strips control characters, which are not in the invalid-character class', () => {
+    const title = 'bad' + String.fromCharCode(7) + 'title' + String.fromCharCode(10) + 'here';
+    expect(dedupeConversationNames([conv('u1', title)]).get('u1')).toBe('bad_title_here');
+  });
+
   it('keeps dots that are not the whole name', () => {
     const names = dedupeConversationNames([conv('u1', 'notes.v2'), conv('u2', '._..')]);
     expect(names.get('u1')).toBe('notes.v2');
@@ -92,7 +118,7 @@ describe('dedupeConversationNames', () => {
   it('honours reserved names so the manifest cannot be claimed', () => {
     const names = dedupeConversationNames(
       [conv('u1', EXPORT_MANIFEST_BASENAME)], [EXPORT_MANIFEST_BASENAME, EXPORT_MANIFEST_FILENAME]);
-    expect(names.get('u1')).not.toBe(EXPORT_MANIFEST_BASENAME);
+    expect(names.get('u1')).toBe(`${EXPORT_MANIFEST_BASENAME}_1`);
   });
 
   it('compares reserved names case-insensitively', () => {
@@ -100,12 +126,12 @@ describe('dedupeConversationNames', () => {
     // and collide with export-manifest.json when extracted.
     const names = dedupeConversationNames(
       [conv('u1', 'Export-Manifest')], [EXPORT_MANIFEST_BASENAME, EXPORT_MANIFEST_FILENAME]);
-    expect(names.get('u1').toLowerCase()).not.toBe(EXPORT_MANIFEST_BASENAME);
+    expect(names.get('u1')).toBe('Export-Manifest_1');
   });
 
   it('folds the case of caller-supplied reserved names too', () => {
     const names = dedupeConversationNames([conv('u1', 'export-manifest')], ['EXPORT-MANIFEST']);
-    expect(names.get('u1')).not.toBe('export-manifest');
+    expect(names.get('u1')).toBe('export-manifest_1');
   });
 
   it('reserves the full manifest filename, not just its basename', () => {
@@ -113,7 +139,7 @@ describe('dedupeConversationNames', () => {
     // the root export-manifest.json file.
     const names = dedupeConversationNames(
       [conv('u1', EXPORT_MANIFEST_FILENAME)], [EXPORT_MANIFEST_BASENAME, EXPORT_MANIFEST_FILENAME]);
-    expect(names.get('u1')).not.toBe(EXPORT_MANIFEST_FILENAME);
+    expect(names.get('u1')).toBe(`${EXPORT_MANIFEST_FILENAME}_1`);
   });
 
   it('protects a real doc_1 regardless of input order', () => {
@@ -300,7 +326,7 @@ describe('fetchWithBackoff', () => {
 
     await run(fetchWithBackoff('u', {}, pacer));
 
-    expect(pacer.notBefore - Date.now()).toBe(pacer.intervalMs);
+    expect(pacer.notBefore - Date.now()).toBe(5000);
   });
 
   it('aborts a long backoff wait instead of sleeping it out', async () => {
@@ -320,7 +346,7 @@ describe('fetchWithBackoff', () => {
     const outcome = await promise;
 
     expect(outcome.error?.exportCancelled).toBe(true);
-    expect(Date.now() - started).toBeLessThan(60000);
+    expect(Date.now() - started).toBeLessThan(2000);
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
@@ -340,6 +366,18 @@ describe('fetchWithBackoff', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     const res = await run(fetchWithBackoff('u', {}, createPacer(200)));
+
+    expect(res.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not spin forever when the pacer deadline is NaN', async () => {
+    // `NaN <= 0` is false, so a naive comparison never breaks out and
+    // setTimeout(fn, NaN) fires immediately — a hot loop that never fetches.
+    const fetchMock = vi.fn().mockResolvedValue(response(200));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const res = await run(fetchWithBackoff('u', {}, { intervalMs: 200, notBefore: NaN }));
 
     expect(res.status).toBe(200);
     expect(fetchMock).toHaveBeenCalledTimes(1);
@@ -516,6 +554,16 @@ describe('addZipFile', () => {
     expect(() => addZipFile(zip, 'main.py', 'second')).toThrow(/Duplicate ZIP entry/);
   });
 
+  it('refuses a duplicate that differs only in Unicode normalization', () => {
+    // macOS normalizes filenames, so NFC and NFD spellings are one file.
+    const combiningAcute = String.fromCharCode(0x301);
+    const name = 'cafe' + combiningAcute + '.py';
+    const zip = new JSZip();
+    addZipFile(zip, 'a/' + name.normalize('NFC'), 'first');
+    expect(() => addZipFile(zip, 'a/' + name.normalize('NFD'), 'second'))
+      .toThrow(/Duplicate ZIP entry/);
+  });
+
   it('refuses a case-variant duplicate on a nested path', () => {
     const zip = new JSZip();
     addZipFile(zip, 'Chats/Recipe.md', 'first');
@@ -544,6 +592,52 @@ describe('addZipFile', () => {
     const zip = new JSZip();
     addZipFile(zip, 'A+B (v2) [draft].md', 'one');
     expect(() => addZipFile(zip, 'AxB (v2) xdraftx.md', 'two')).not.toThrow();
+  });
+});
+
+describe('extractArtifactFiles filename dedup', () => {
+  // The producer must agree with addZipFile's guard. When it did not, a
+  // conversation holding both Main.py and main.py threw on every run and could
+  // never be exported at all.
+  const artifact = (filename) => ({
+    type: 'tool_use', name: 'artifacts',
+    display_content: { type: 'code_block', code: 'print(1)', language: 'python', filename },
+  });
+  const conversation = (...filenames) => ({
+    name: 'Conv', uuid: 'u1', current_leaf_message_uuid: 'm2',
+    chat_messages: [
+      { uuid: 'm1', sender: 'human', parent_message_uuid: '00000000-0000-0000-0000-000000000000', content: [] },
+      { uuid: 'm2', sender: 'assistant', parent_message_uuid: 'm1', content: filenames.map(artifact) },
+    ],
+  });
+
+  const namesFor = (...filenames) =>
+    extractArtifactFiles(conversation(...filenames), 'original').map(a => a.filename);
+
+  it('separates artifact filenames differing only in case', () => {
+    const names = namesFor('Main.py', 'main.py');
+    expect(names).toHaveLength(2);
+    expect(new Set(names.map(n => n.toLowerCase())).size).toBe(2);
+  });
+
+  it('separates artifact filenames differing only in normalization', () => {
+    const combiningAcute = String.fromCharCode(0x301);
+    const base = 'cafe' + combiningAcute + '.py';
+    const names = namesFor(base.normalize('NFC'), base.normalize('NFD'));
+    expect(names).toHaveLength(2);
+    expect(new Set(names.map(n => n.normalize('NFC').toLowerCase())).size).toBe(2);
+  });
+
+  it('produces names that addZipFile will accept together', () => {
+    const zip = new JSZip();
+    for (const name of namesFor('Main.py', 'main.py', 'MAIN.py')) {
+      expect(() => addZipFile(zip, `Conv/artifacts/${name}`, 'x')).not.toThrow();
+    }
+  });
+
+  it('strips control characters from artifact filenames', () => {
+    const names = namesFor('we' + String.fromCharCode(9) + 'ird.py');
+    expect(names[0]).not.toContain(String.fromCharCode(9));
   });
 });
 
@@ -611,6 +705,11 @@ describe('reconcileManifest', () => {
     expect(reconcileManifest([entry({ files: ['Chats/a.md'] })], zip).ok).toBe(false);
   });
 
+  it('ignores pending entries', () => {
+    // What every unreached conversation holds after a cancelled run.
+    expect(reconcileManifest([entry({ status: 'pending', files: [] })], new JSZip()).ok).toBe(true);
+  });
+
   it('ignores cancelled entries', () => {
     const entries = [entry({ status: 'cancelled', files: [] })];
     expect(reconcileManifest(entries, new JSZip()).ok).toBe(true);
@@ -658,11 +757,13 @@ describe('exportedUuids', () => {
     expect(exportedUuids(entries, reconciliation)).toEqual(['u1']);
   });
 
-  it('distinguishes the three terminal statuses from each other', () => {
+  it('distinguishes every terminal status from a success', () => {
     const entries = [
       { uuid: 'e', status: 'exported', files: ['e.md'] },
       { uuid: 's', status: 'skipped', files: [] },
       { uuid: 'f', status: 'failed', files: [] },
+      { uuid: 'c', status: 'cancelled', files: [] },
+      { uuid: 'p', status: 'pending', files: [] },
     ];
     expect(exportedUuids(entries, clean)).toEqual(['e']);
   });
@@ -675,7 +776,7 @@ describe('helpers composed as the export loops use them', () => {
   it('keeps two conversations that share a title', async () => {
     const conversations = [conv('u1', 'Recipe'), conv('u2', 'Recipe')];
     const safeNames = dedupeConversationNames(conversations, [
-      EXPORT_MANIFEST_FILENAME.replace(/\.json$/, ''),
+      EXPORT_MANIFEST_BASENAME, EXPORT_MANIFEST_FILENAME,
     ]);
     const entries = conversations.map(c => ({
       uuid: c.uuid, title: c.name, status: 'pending', files: [],
@@ -719,9 +820,9 @@ describe('helpers composed as the export loops use them', () => {
   });
 
   it('reserves the manifest filename against a conversation of that name', () => {
-    const reserved = EXPORT_MANIFEST_FILENAME.replace(/\.json$/, '');
-    const conversations = [conv('u1', reserved)];
-    const safeNames = dedupeConversationNames(conversations, [reserved]);
+    const conversations = [conv('u1', EXPORT_MANIFEST_BASENAME)];
+    const safeNames = dedupeConversationNames(conversations,
+      [EXPORT_MANIFEST_BASENAME, EXPORT_MANIFEST_FILENAME]);
     const zip = new JSZip();
 
     addZipFile(zip, `${safeNames.get('u1')}.json`, 'conversation body');
