@@ -843,6 +843,11 @@ async function exportAllFiltered() {
     const progressBar = document.getElementById('progressBar');
     const progressText = document.getElementById('progressText');
     const progressStats = document.getElementById('progressStats');
+    // This path has nothing to cancel, and reusing the button would fire a
+    // previous bulk run's stale handler.
+    const cancelButton = document.getElementById('cancelExport');
+    cancelButton.onclick = null;
+    cancelButton.disabled = true;
     progressModal.style.display = 'block';
     progressText.textContent = `Exporting ${conv.name}...`;
     progressBar.style.width = '0%';
@@ -851,6 +856,7 @@ async function exportAllFiltered() {
       await exportConversation(conv.uuid, conv.name);
       progressBar.style.width = '100%';
     } finally {
+      cancelButton.disabled = false;
       progressModal.style.display = 'none';
       button.disabled = false;
       button.textContent = originalButtonText;
@@ -1030,7 +1036,7 @@ async function exportAllFiltered() {
         // which leave the try block early.
         const progress = Math.round((completed + failed) / total * 100);
         progressBar.style.width = `${progress}%`;
-        progressStats.textContent = `${completed} succeeded, ${failed} failed out of ${total}`;
+        progressStats.textContent = `${completed} processed, ${failed} failed out of ${total}`;
       }
     }
 
@@ -1138,10 +1144,12 @@ async function exportAllFiltered() {
 
     if (cancelledEarly) {
       showToast(`Export cancelled — partial ZIP with ${reconciledIds.length} of ${total} conversations downloaded.`);
-    } else if (failed > 0) {
-      showToast(`Exported ${completed} of ${total} conversations (${failed} failed).`);
+    } else if (reconciledIds.length < total) {
+      // `completed` counts skipped conversations too, so it can read as a full
+      // success on a run that recorded no exports at all.
+      showToast(`Exported ${reconciledIds.length} of ${total} conversations.`);
     } else {
-      showToast(`Successfully exported all ${completed} conversations!`);
+      showToast(`Successfully exported all ${reconciledIds.length} conversations!`);
     }
 
   } catch (error) {

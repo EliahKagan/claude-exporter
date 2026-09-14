@@ -340,6 +340,7 @@ function getLocalDateTimeString() {
         // Shared tail for both export shapes.
         const finishExport = async (zip, prefix) => {
           const reconciliation = reconcileManifest(manifestEntries, zip);
+          const reconciledIds = exportedUuids(manifestEntries, reconciliation);
 
           // Plain zip.file: the name is reserved in the dedup set above, so it
           // cannot collide, and throwing here would destroy the whole archive
@@ -347,10 +348,15 @@ function getLocalDateTimeString() {
           zip.file(EXPORT_MANIFEST_FILENAME, JSON.stringify({
             generatedAt: new Date().toISOString(),
             total: manifestEntries.length,
+            // Same buckets the browse page writes, so a consumer gets one
+            // contract whichever button produced the archive. Every
+            // conversation lands in exactly one, so these sum to total.
             counts: {
-              exported: exportedUuids(manifestEntries, reconciliation).length,
+              exported: reconciledIds.length,
+              unreconciled: reconciliation.missing.length,
               skipped: manifestEntries.filter(entry => entry.status === 'skipped').length,
-              failed: manifestEntries.filter(entry => entry.status === 'failed').length
+              failed: manifestEntries.filter(entry => entry.status === 'failed').length,
+              pending: manifestEntries.filter(entry => entry.status === 'pending').length
             },
             reconciliation,
             conversations: manifestEntries
@@ -371,20 +377,21 @@ function getLocalDateTimeString() {
 
           // Only conversations whose files are provably in the archive get a
           // timestamp; anything else stays flagged as new on the next run.
-          const reconciledIds = exportedUuids(manifestEntries, reconciliation);
           recordExportTimestamps(reconciledIds);
 
           // Reported through the popup's existing warnings channel rather than
           // alert(): a content script's alert is tab-modal, is deferred while
           // the tab is in the background, and would block sendResponse until
-          // someone dismissed a dialog they cannot see.
+          // someone dismissed a dialog they cannot see. Kept separate from the
+          // per-conversation failure list so an integrity problem does not read
+          // as one more ordinary failure.
           const problems = [];
           if (!reconciliation.ok) {
-            problems.push(`${reconciliation.missing.length} conversation(s) are missing files from the ZIP`);
+            problems.push(`INTEGRITY: ${reconciliation.missing.length} conversation(s) are missing files from the ZIP`);
           }
           const duplicates = manifestEntries.filter(entry => entry.duplicateZipEntry);
           if (duplicates.length > 0) {
-            problems.push(`${duplicates.length} conversation(s) hit a duplicate ZIP path`);
+            problems.push(`INTEGRITY: ${duplicates.length} conversation(s) hit a duplicate ZIP path`);
           }
 
           return { count: reconciledIds.length, problems };
@@ -489,7 +496,7 @@ function getLocalDateTimeString() {
           const prefix = (request.flattenArtifacts && !request.extractArtifacts && request.includeChats === false) ? 'claude-artifacts' : 'claude-exports';
           const { count: exportedCount, problems } = await finishExport(zip, prefix);
 
-          const errors = describeFailures().concat(problems);
+          const errors = problems.concat(describeFailures());
           if (errors.length > 0) {
             console.warn('Some conversations failed to export:', errors);
             sendResponse({
@@ -544,7 +551,7 @@ function getLocalDateTimeString() {
 
           const { count: exportedCount, problems } = await finishExport(zip, 'claude-exports');
 
-          const errors = describeFailures().concat(problems);
+          const errors = problems.concat(describeFailures());
           if (errors.length > 0) {
             console.warn('Some conversations failed to export:', errors);
             sendResponse({
