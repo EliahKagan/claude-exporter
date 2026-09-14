@@ -65,6 +65,19 @@ describe('dedupeConversationNames', () => {
     expect(names.get('uuid-abc')).toBe('uuid-abc');
   });
 
+  it.each(['.', '..', '...'])('falls back to the UUID for the path-segment name %s', (title) => {
+    // As a nested-export folder these produce "./x" or "../x", which collide
+    // with a root entry or escape the extraction directory once normalized.
+    const names = dedupeConversationNames([conv('uuid-abc', title)]);
+    expect(names.get('uuid-abc')).toBe('uuid-abc');
+  });
+
+  it('keeps dots that are not the whole name', () => {
+    const names = dedupeConversationNames([conv('u1', 'notes.v2'), conv('u2', '._..')]);
+    expect(names.get('u1')).toBe('notes.v2');
+    expect(names.get('u2')).toBe('._..');
+  });
+
   it('strips the <>:"/\\|?* character set', () => {
     const names = dedupeConversationNames([conv('u1', 'a/b:c*d?e"f<g>h|i')]);
     expect(names.get('u1')).toBe('a_b_c_d_e_f_g_h_i');
@@ -268,6 +281,26 @@ describe('fetchWithBackoff', () => {
     await run(fetchWithBackoff('u', {}, pacer));
 
     expect(pacer.intervalMs).toBe(800);
+  });
+
+  it('still honours the final Retry-After after exhausting its retries', async () => {
+    // Giving up on this conversation must not discard the server's cooldown for
+    // the next one — that is precisely how a run walks back into the limiter.
+    const pacer = createPacer(200);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response(429, '60')));
+
+    await run(fetchWithBackoff('u', {}, pacer));
+
+    expect(pacer.notBefore - Date.now()).toBe(60000);
+  });
+
+  it('falls back to the interval when the exhausted response has no Retry-After', async () => {
+    const pacer = createPacer(200);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response(429)));
+
+    await run(fetchWithBackoff('u', {}, pacer));
+
+    expect(pacer.notBefore - Date.now()).toBe(pacer.intervalMs);
   });
 
   it('does not retry a 403', async () => {

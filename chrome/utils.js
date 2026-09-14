@@ -1061,7 +1061,11 @@ function dedupeConversationNames(conversations, reservedNames = []) {
   // producing a file called ".md".
   const sanitize = (conv) => {
     const title = (conv.name || '').trim();
-    return (title || conv.uuid).replace(/[<>:"/\\|?*]/g, '_');
+    const cleaned = (title || conv.uuid).replace(/[<>:"/\\|?*]/g, '_');
+    // "." and ".." are path segments, not names: as a nested-export folder they
+    // produce entries like "./x" or "../x", which collide with a root entry or
+    // escape the extraction directory once an unzip tool normalizes them.
+    return /^\.+$/.test(cleaned) ? conv.uuid : cleaned;
   };
 
   // Pass 1: every name a conversation could claim on its own merits. A
@@ -1141,8 +1145,14 @@ async function fetchWithBackoff(url, options, pacer) {
       return response;
     }
 
-    const delay = computeRetryDelay(response.status, response.headers.get('Retry-After'), attempt);
+    const retryAfter = response.headers.get('Retry-After');
+    const delay = computeRetryDelay(response.status, retryAfter, attempt);
     if (delay === null) {
+      // Out of retries for this conversation, but the server's cooldown still
+      // governs whatever the loop does next. Returning here without applying it
+      // would send the next request as soon as the ordinary interval elapsed.
+      const cooldown = computeRetryDelay(response.status, retryAfter, 0) || 0;
+      pacer.notBefore = Date.now() + Math.max(cooldown, pacer.intervalMs);
       return response;
     }
 
