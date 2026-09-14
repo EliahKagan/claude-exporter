@@ -921,7 +921,8 @@ async function exportAllFiltered() {
                 'Accept': 'application/json',
               }
             },
-            pacer
+            pacer,
+            () => cancelExport
           );
 
           if (!response.ok) {
@@ -1013,6 +1014,13 @@ async function exportAllFiltered() {
           completed++;
 
         } catch (error) {
+          if (error.exportCancelled) {
+            // Interrupted mid-request by the Cancel button; nothing was written
+            // for this conversation, so it must stay flagged as new.
+            entry.status = 'cancelled';
+            entry.reason = 'export cancelled during this conversation';
+            return;
+          }
           console.error(`Failed to export ${conv.name}:`, error);
           entry.status = 'failed';
           entry.reason = error.message;

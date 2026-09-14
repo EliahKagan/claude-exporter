@@ -1050,6 +1050,7 @@ const EXPORT_MANIFEST_FILENAME = `${EXPORT_MANIFEST_BASENAME}.json`;
 const MAX_RETRY_ATTEMPTS = 6;
 const MAX_RETRY_DELAY_MS = 60000;
 const MAX_PACER_INTERVAL_MS = 5000;
+const CANCEL_POLL_MS = 250;
 
 // Assign a collision-free base filename to every conversation up front, before
 // the export loop runs, so numbering never depends on completion order.
@@ -1124,11 +1125,24 @@ function createPacer(intervalMs) {
 // fetch() that waits for the pacer, retries 429s, and returns the final
 // response (including a 429 that exhausted its attempts) for the caller to
 // check with response.ok as usual.
-async function fetchWithBackoff(url, options, pacer) {
+function cancelledError() {
+  const error = new Error('Export cancelled');
+  error.exportCancelled = true;
+  return error;
+}
+
+async function fetchWithBackoff(url, options, pacer, isCancelled = () => false) {
   for (let attempt = 0; ; attempt++) {
-    const waitMs = pacer.notBefore - Date.now();
-    if (waitMs > 0) {
-      await new Promise(resolve => setTimeout(resolve, waitMs));
+    // Slept in slices rather than one timer: a Retry-After of 60 would
+    // otherwise leave a cancelled export sitting for minutes before it could
+    // package the conversations it already has.
+    while (!isCancelled()) {
+      const waitMs = pacer.notBefore - Date.now();
+      if (waitMs <= 0) break;
+      await new Promise(resolve => setTimeout(resolve, Math.min(waitMs, CANCEL_POLL_MS)));
+    }
+    if (isCancelled()) {
+      throw cancelledError();
     }
 
     let response;

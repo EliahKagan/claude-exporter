@@ -303,6 +303,48 @@ describe('fetchWithBackoff', () => {
     expect(pacer.notBefore - Date.now()).toBe(pacer.intervalMs);
   });
 
+  it('aborts a long backoff wait instead of sleeping it out', async () => {
+    // The whole point: a 60s Retry-After must not keep a cancelled export
+    // waiting minutes before it can package what it already has.
+    const pacer = createPacer(200);
+    let cancelled = false;
+    const fetchMock = vi.fn().mockResolvedValue(response(429, '60'));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const started = Date.now();
+    const promise = fetchWithBackoff('u', {}, pacer, () => cancelled).then(
+      () => ({ ok: true }), (error) => ({ error }));
+    await vi.advanceTimersByTimeAsync(1000);
+    cancelled = true;
+    await vi.runAllTimersAsync();
+    const outcome = await promise;
+
+    expect(outcome.error?.exportCancelled).toBe(true);
+    expect(Date.now() - started).toBeLessThan(60000);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not start another attempt once cancelled', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response(429, '0'));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const outcome = await run(fetchWithBackoff('u', {}, createPacer(200), () => true)
+      .then(() => ({ ok: true }), (error) => ({ error })));
+
+    expect(outcome.error?.exportCancelled).toBe(true);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('is uncancelled by default, so other callers are unaffected', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response(200));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const res = await run(fetchWithBackoff('u', {}, createPacer(200)));
+
+    expect(res.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it('does not retry a 403', async () => {
     const fetchMock = vi.fn().mockResolvedValue(response(403));
     vi.stubGlobal('fetch', fetchMock);
