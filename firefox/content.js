@@ -102,12 +102,15 @@ function getLocalDateTimeString() {
   async function fetchAllConversations(orgId) {
     const url = `https://claude.ai/api/organizations/${orgId}/chat_conversations`;
     
-    const response = await fetch(url, {
+    // Through the backoff helper like every other request: a single 429 here
+    // aborts the whole export before it starts, and this is also the call the
+    // browse page relays through.
+    const response = await fetchWithBackoff(url, {
       credentials: 'include',
       headers: {
         'Accept': 'application/json',
       }
-    });
+    }, createPacer(0));
     
     if (!response.ok) {
       throw new Error(`Failed to fetch conversations: ${response.status}`);
@@ -159,7 +162,7 @@ function getLocalDateTimeString() {
     console.log('Export conversation request received:', request);
 
     fetchConversation(request.orgId, request.conversationId)
-      .then(data => {
+      .then(async data => {
         console.log('Conversation data fetched successfully:', data);
 
         // Validate conversation data structure
@@ -224,17 +227,18 @@ function getLocalDateTimeString() {
               }
             }
 
-            // Generate and download ZIP
-            zip.generateAsync({ type: 'blob' }).then(blob => {
-              const url = URL.createObjectURL(blob);
-              const a = document.createElement('a');
-              a.href = url;
-              a.download = `${data.name || request.conversationId}.zip`;
-              document.body.appendChild(a);
-              a.click();
-              document.body.removeChild(a);
-              URL.revokeObjectURL(url);
-            });
+            // Awaited before the timestamp is recorded, for the same reason as
+            // the bulk paths: a rejected generateAsync would otherwise leave the
+            // conversation marked exported with nothing downloaded.
+            const blob = await zip.generateAsync({ type: 'blob' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `${data.name || request.conversationId}.zip`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
 
             console.log(`Downloading ZIP with conversation and ${artifactFiles.length} artifact(s)`);
             recordExportTimestamp(request.conversationId);
@@ -347,6 +351,7 @@ function getLocalDateTimeString() {
           // at the last step.
           zip.file(EXPORT_MANIFEST_FILENAME, JSON.stringify({
             generatedAt: new Date().toISOString(),
+            cancelled: false,   // no cancel button on this path; kept so the schema matches
             total: manifestEntries.length,
             // Same buckets the browse page writes, so a consumer gets one
             // contract whichever button produced the archive. Every
@@ -356,6 +361,7 @@ function getLocalDateTimeString() {
               unreconciled: reconciliation.missing.length,
               skipped: manifestEntries.filter(entry => entry.status === 'skipped').length,
               failed: manifestEntries.filter(entry => entry.status === 'failed').length,
+              cancelled: 0,
               pending: manifestEntries.filter(entry => entry.status === 'pending').length
             },
             reconciliation,
@@ -480,8 +486,10 @@ function getLocalDateTimeString() {
               if (entry.status === 'skipped') {
                 entry.reason = 'nothing to write for the selected options';
               }
-              included++;
-              console.log(`  Added to export (${processed}/${conversations.length} scanned, ${included} included)`);
+              if (entry.status === 'exported') {
+                included++;
+                console.log(`  Added to export (${processed}/${conversations.length} scanned, ${included} included)`);
+              }
             } catch (error) {
               console.error(`Failed to export conversation ${conv.uuid}:`, error);
               entry.status = 'failed';
@@ -496,13 +504,16 @@ function getLocalDateTimeString() {
           const prefix = (request.flattenArtifacts && !request.extractArtifacts && request.includeChats === false) ? 'claude-artifacts' : 'claude-exports';
           const { count: exportedCount, problems } = await finishExport(zip, prefix);
 
-          const errors = problems.concat(describeFailures());
-          if (errors.length > 0) {
-            console.warn('Some conversations failed to export:', errors);
+          const failures = describeFailures();
+          if (problems.length > 0 || failures.length > 0) {
+            console.warn('Export completed with problems:', { problems, failures });
+            const detail = [];
+            if (problems.length > 0) detail.push(problems.join('; '));
+            if (failures.length > 0) detail.push(`Failed: ${failures.join('; ')}`);
             sendResponse({
               success: true,
               count: exportedCount,
-              warnings: `Exported ${exportedCount}/${conversations.length} conversations. Some failed: ${errors.join('; ')}`
+              warnings: `Exported ${exportedCount}/${conversations.length} conversations. ${detail.join(' | ')}`
             });
           } else {
             sendResponse({ success: true, count: exportedCount });
@@ -536,9 +547,14 @@ function getLocalDateTimeString() {
                 filename = `${safeName}.json`;
               }
 
-              addZipFile(zip, filename, content);
-              entry.files.push(filename);
-              entry.status = 'exported';
+              if (request.includeChats !== false) {
+                addZipFile(zip, filename, content);
+                entry.files.push(filename);
+              }
+              entry.status = entry.files.length > 0 ? 'exported' : 'skipped';
+              if (entry.status === 'skipped') {
+                entry.reason = 'nothing to write for the selected options';
+              }
             } catch (error) {
               console.error(`Failed to export conversation ${conv.uuid}:`, error);
               entry.status = 'failed';
@@ -551,13 +567,16 @@ function getLocalDateTimeString() {
 
           const { count: exportedCount, problems } = await finishExport(zip, 'claude-exports');
 
-          const errors = problems.concat(describeFailures());
-          if (errors.length > 0) {
-            console.warn('Some conversations failed to export:', errors);
+          const failures = describeFailures();
+          if (problems.length > 0 || failures.length > 0) {
+            console.warn('Export completed with problems:', { problems, failures });
+            const detail = [];
+            if (problems.length > 0) detail.push(problems.join('; '));
+            if (failures.length > 0) detail.push(`Failed: ${failures.join('; ')}`);
             sendResponse({
               success: true,
               count: exportedCount,
-              warnings: `Exported ${exportedCount}/${conversations.length} conversations. Some failed: ${errors.join('; ')}`
+              warnings: `Exported ${exportedCount}/${conversations.length} conversations. ${detail.join(' | ')}`
             });
           } else {
             sendResponse({ success: true, count: exportedCount });

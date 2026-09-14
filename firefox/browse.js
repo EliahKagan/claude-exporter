@@ -105,11 +105,23 @@ async function saveExportTimestamp(conversationId) {
 
 async function saveExportTimestamps(conversationIds) {
   const now = new Date().toISOString();
-  for (const id of conversationIds) {
-    exportTimestamps[id] = now;
-  }
-  return new Promise((resolve) => {
-    chrome.storage.local.set({ exportTimestamps }, resolve);
+  return new Promise((resolve, reject) => {
+    // Re-read first: this page may have been open while a popup export wrote
+    // its own timestamps, and writing our stale copy would drop them.
+    chrome.storage.local.get(['exportTimestamps'], (stored) => {
+      const merged = Object.assign({}, stored.exportTimestamps || {}, exportTimestamps);
+      for (const id of conversationIds) {
+        merged[id] = now;
+        exportTimestamps[id] = now;
+      }
+      chrome.storage.local.set({ exportTimestamps: merged }, () => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+          return;
+        }
+        resolve();
+      });
+    });
   });
 }
 
@@ -847,7 +859,7 @@ async function exportAllFiltered() {
     // previous bulk run's stale handler.
     const cancelButton = document.getElementById('cancelExport');
     cancelButton.onclick = null;
-    cancelButton.disabled = true;
+    cancelButton.style.display = 'none';
     progressModal.style.display = 'block';
     progressText.textContent = `Exporting ${conv.name}...`;
     progressBar.style.width = '0%';
@@ -856,7 +868,7 @@ async function exportAllFiltered() {
       await exportConversation(conv.uuid, conv.name);
       progressBar.style.width = '100%';
     } finally {
-      cancelButton.disabled = false;
+      cancelButton.style.display = '';
       progressModal.style.display = 'none';
       button.disabled = false;
       button.textContent = originalButtonText;
@@ -1145,9 +1157,11 @@ async function exportAllFiltered() {
     if (cancelledEarly) {
       showToast(`Export cancelled — partial ZIP with ${reconciledIds.length} of ${total} conversations downloaded.`);
     } else if (reconciledIds.length < total) {
-      // `completed` counts skipped conversations too, so it can read as a full
-      // success on a run that recorded no exports at all.
-      showToast(`Exported ${reconciledIds.length} of ${total} conversations.`);
+      // Reconciled count rather than `completed`, which counts skips and so can
+      // read as a full success on a run that recorded no exports at all — but
+      // still name the failures, or an HTTP failure looks like a skip.
+      const skipped = manifestEntries.filter(entry => entry.status === 'skipped').length;
+      showToast(`Exported ${reconciledIds.length} of ${total} conversations (${failed} failed, ${skipped} skipped).`);
     } else {
       showToast(`Successfully exported all ${reconciledIds.length} conversations!`);
     }
