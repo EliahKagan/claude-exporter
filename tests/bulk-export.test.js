@@ -19,6 +19,7 @@ const {
   extractArtifactFiles,
   filenameKey,
   safeConversationName,
+  getCurrentBranch,
   getFileExtension,
   isProgrammingLanguage,
   reconcileManifest,
@@ -762,6 +763,34 @@ describe('filenameKey', () => {
     expect(() => addZipFile(zip, 'note.MD', 'y')).toThrow();
     expect(uniqueZipPath(zip, 'note.MD')).not.toBe('note.MD');
     expect(dedupeConversationNames([conv('u1', 'Note'), conv('u2', 'note')]).get('u2')).toBe('note_1');
+  });
+});
+
+describe('getCurrentBranch', () => {
+  it('terminates on a cyclic parent chain', () => {
+    // Malformed, but a hang here freezes the whole export inside the loop
+    // where the cancel flag is never checked.
+    const data = {
+      current_leaf_message_uuid: 'b',
+      chat_messages: [
+        { uuid: 'a', parent_message_uuid: 'b', sender: 'human', content: [] },
+        { uuid: 'b', parent_message_uuid: 'a', sender: 'assistant', content: [] },
+      ],
+    };
+    const branch = getCurrentBranch(data);
+    expect(branch.length).toBeLessThanOrEqual(2);
+  });
+
+  it('still walks a normal chain to the root', () => {
+    const data = {
+      current_leaf_message_uuid: 'c',
+      chat_messages: [
+        { uuid: 'a', parent_message_uuid: null, sender: 'human', content: [] },
+        { uuid: 'b', parent_message_uuid: 'a', sender: 'assistant', content: [] },
+        { uuid: 'c', parent_message_uuid: 'b', sender: 'human', content: [] },
+      ],
+    };
+    expect(getCurrentBranch(data).map(m => m.uuid)).toEqual(['a', 'b', 'c']);
   });
 });
 

@@ -14,9 +14,19 @@ function getCurrentBranch(data) {
   
   // Trace back from the current leaf to the root
   const branch = [];
+  const visited = new Set();
   let currentUuid = data.current_leaf_message_uuid;
-  
+
   while (currentUuid && messageMap.has(currentUuid)) {
+    // A parent chain that loops back on itself would spin here forever,
+    // growing the branch without bound, inside the export loop where the
+    // cancel flag is never polled — one malformed conversation would take the
+    // whole run with it.
+    if (visited.has(currentUuid)) {
+      break;
+    }
+    visited.add(currentUuid);
+
     const message = messageMap.get(currentUuid);
     branch.unshift(message); // Add to beginning to maintain order
     currentUuid = message.parent_message_uuid;
