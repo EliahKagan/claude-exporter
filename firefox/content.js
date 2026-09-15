@@ -135,6 +135,13 @@ function getLocalDateTimeString() {
 
   // Handle messages from popup
   chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  // Liveness probe from the browse page, answered before anything else and
+  // synchronously: it reports only whether this content script can still reply.
+  if (request.action === 'ping') {
+    sendResponse({ success: true });
+    return false;
+  }
+
   // Auto-detect organization ID from Claude.ai API
   if (request.action === 'detectOrgId') {
     console.log('Auto-detecting organization ID...');

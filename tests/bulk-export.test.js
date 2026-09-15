@@ -19,6 +19,9 @@ const {
   collectArtifactMeta,
   artifactFromToolInput,
   convertToMarkdown,
+  isReadyTab,
+  orderClaudeTabs,
+  chooseRelayTab,
   uniqueZipPath,
   extractArtifactFiles,
   filenameKey,
@@ -1076,6 +1079,111 @@ describe('chat body and artifacts folder agree', () => {
     expect(markdown).not.toContain('Artifact: Untitled');
     expect(markdown).toContain('**Type:** code | **Language:** python');
     expect(markdown).toContain('```python\nprint(2)\n```');
+  });
+});
+
+describe('browse-page relay tab selection', () => {
+  const tab = (id, { win = 1, ready = true } = {}) => ({
+    id, windowId: win,
+    discarded: !ready,
+    status: ready ? 'complete' : 'loading',
+  });
+
+  describe('isReadyTab', () => {
+    it('rejects a tab Chrome discarded and one still loading', () => {
+      expect(isReadyTab({ discarded: false, status: 'complete' })).toBe(true);
+      expect(isReadyTab({ discarded: true, status: 'complete' })).toBe(false);
+      expect(isReadyTab({ discarded: false, status: 'loading' })).toBe(false);
+    });
+  });
+
+  describe('orderClaudeTabs', () => {
+    it('prefers a live tab in another window over a discarded one in this window', () => {
+      // The session-restore case: Chrome lazy-loads background tabs as
+      // discarded, and preferring the current window first sent to one of those
+      // while a working tab sat in the next window.
+      const here = [tab(11, { ready: false })];
+      const all = [tab(11, { ready: false }), tab(22, { win: 2 })];
+      expect(orderClaudeTabs(here, all).map(t => t.id)).toEqual([22, 11]);
+    });
+
+    it('prefers the current window among tabs that are equally ready', () => {
+      const here = [tab(11)];
+      const all = [tab(22, { win: 2 }), tab(11)];
+      expect(orderClaudeTabs(here, all)[0].id).toBe(11);
+    });
+
+    it('still offers an unready tab rather than none at all', () => {
+      const here = [tab(11, { ready: false })];
+      expect(orderClaudeTabs(here, here).map(t => t.id)).toEqual([11]);
+    });
+
+    it('lists each tab once even though the queries overlap', () => {
+      // The all-windows query is a superset of the current-window one.
+      const here = [tab(11), tab(12)];
+      const all = [tab(11), tab(12), tab(22, { win: 2 })];
+      expect(orderClaudeTabs(here, all).map(t => t.id)).toEqual([11, 12, 22]);
+    });
+
+    it('returns nothing when no claude.ai tab is open', () => {
+      expect(orderClaudeTabs([], [])).toEqual([]);
+    });
+  });
+
+  describe('chooseRelayTab', () => {
+    const probeFrom = (states) => {
+      const asked = [];
+      const probe = async (id) => { asked.push(id); return states[id]; };
+      probe.asked = asked;
+      return probe;
+    };
+
+    it('takes the first tab that answers the ping', async () => {
+      const probe = probeFrom({ 1: 'alive', 2: 'alive' });
+      expect((await chooseRelayTab([tab(1), tab(2)], probe)).id).toBe(1);
+    });
+
+    it('stops probing once a tab answers', async () => {
+      const probe = probeFrom({ 1: 'alive', 2: 'alive' });
+      await chooseRelayTab([tab(1), tab(2)], probe);
+      expect(probe.asked).toEqual([1]);
+    });
+
+    it('skips a silent tab and takes a live one behind it', async () => {
+      // Silence is the wedged case: a listener holding the channel open and
+      // never replying, which is what hung the page indefinitely.
+      const probe = probeFrom({ 1: 'silent', 2: 'alive' });
+      expect((await chooseRelayTab([tab(1), tab(2)], probe)).id).toBe(2);
+    });
+
+    it('never chooses a silent tab, even as the last resort', async () => {
+      const probe = probeFrom({ 1: 'silent', 2: 'silent' });
+      expect(await chooseRelayTab([tab(1), tab(2)], probe)).toBeNull();
+    });
+
+    it('falls back to a tab that answered with an error', async () => {
+      // A content script injected before the ping handler existed refuses the
+      // ping but still serves the real actions, and the double-injection guard
+      // means an extension update cannot replace it until the tab reloads.
+      const probe = probeFrom({ 1: 'responsive' });
+      expect((await chooseRelayTab([tab(1)], probe)).id).toBe(1);
+    });
+
+    it('prefers a tab that ponged over an earlier one that only errored', async () => {
+      const probe = probeFrom({ 1: 'responsive', 2: 'alive' });
+      expect((await chooseRelayTab([tab(1), tab(2)], probe)).id).toBe(2);
+    });
+
+    it('keeps the first error-answering tab, not the last', async () => {
+      const probe = probeFrom({ 1: 'responsive', 2: 'responsive' });
+      expect((await chooseRelayTab([tab(1), tab(2)], probe)).id).toBe(1);
+    });
+
+    it('returns null for no candidates rather than throwing', async () => {
+      // pickClaudeTab used to index an empty array and throw from inside a
+      // callback, where the rejection could not be observed.
+      expect(await chooseRelayTab([], probeFrom({}))).toBeNull();
+    });
   });
 });
 

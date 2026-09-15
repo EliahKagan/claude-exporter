@@ -1247,6 +1247,50 @@ function assertConversationShape(data) {
   }
 }
 
+// --- Browse-page relay tab selection -------------------------------------
+// Pure policy, kept here so it is testable: browse.js owns only the parts that
+// touch chrome.tabs.
+
+function isReadyTab(tab) {
+  return !tab.discarded && tab.status === 'complete';
+}
+
+// Ready tabs before asleep ones, and only within each group the current window
+// before the others. Ordering by window first would send to a discarded tab in
+// this window over a live one next door — and Chrome discards background tabs
+// freely when restoring a session, which is exactly when this goes wrong.
+function orderClaudeTabs(current, all) {
+  // The all-windows query is a superset of the current-window one, so the
+  // current tabs are removed from it rather than de-duplicated afterwards.
+  const inCurrent = new Set(current.map(tab => tab.id));
+  const elsewhere = all.filter(tab => !inCurrent.has(tab.id));
+
+  return [
+    ...current.filter(isReadyTab),
+    ...elsewhere.filter(isReadyTab),
+    ...current.filter(tab => !isReadyTab(tab)),
+    ...elsewhere.filter(tab => !isReadyTab(tab)),
+  ];
+}
+
+// Picks the first tab that answers the probe, stopping as soon as one does. A
+// tab that answers with an error is kept only as a fallback: it proves the
+// message plumbing works, which is what a content script predating the ping
+// handler looks like, but a tab that actually ponged is always preferred.
+// A tab that says nothing is never chosen — that is the wedged case this
+// exists to route around.
+async function chooseRelayTab(candidates, probe) {
+  let fallback = null;
+
+  for (const tab of candidates) {
+    const state = await probe(tab.id);
+    if (state === 'alive') return tab;
+    if (state === 'responsive' && fallback === null) fallback = tab;
+  }
+
+  return fallback;
+}
+
 // Reserved ZIP entry name for the per-run export manifest. Both forms are
 // reserved against conversation titles: the basename covers a conversation
 // titled "export-manifest" exported as JSON, the full name covers one titled
@@ -1589,6 +1633,9 @@ if (typeof module !== 'undefined' && module.exports) {
     toZipBytes,
     collectArtifactMeta,
     artifactFromToolInput,
+    isReadyTab,
+    orderClaudeTabs,
+    chooseRelayTab,
     uniqueZipPath,
     reconcileManifest,
     assertConversationShape,
