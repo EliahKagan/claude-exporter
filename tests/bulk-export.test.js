@@ -242,6 +242,19 @@ describe('dedupeConversationNames', () => {
     }
   });
 
+  it('replaces every unsafe code point, not just the first', async () => {
+    // With the regex's /g flag dropped, only the leading surrogate is replaced
+    // and the trailing ones still collapse to one archive entry.
+    const title = (tail) => 'R' + String.fromCharCode(0xd83d) + 'x' + String.fromCharCode(tail) + 'y';
+    const names = dedupeConversationNames([
+      conv('u1', title(0xd83d)), conv('u2', title(0xdc00)),
+    ]);
+    const zip = new JSZip();
+    for (const name of names.values()) addZipFile(zip, `${name}.md`, 'x');
+    const reloaded = await JSZip.loadAsync(await zip.generateAsync({ type: 'nodebuffer' }));
+    expect(Object.keys(reloaded.files)).toHaveLength(2);
+  });
+
   it('keeps valid astral characters', () => {
     const emoji = String.fromCodePoint(0x1f600);
     expect(dedupeConversationNames([conv('u1', `a${emoji}b`)]).get('u1')).toBe(`a${emoji}b`);
@@ -307,9 +320,13 @@ describe('dedupeConversationNames', () => {
     expect(names.get('u1')).not.toMatch(/[. ]$/);
   });
 
-  it('strips the <>:"/\\|?* character set', () => {
-    const names = dedupeConversationNames([conv('u1', 'a/b:c*d?e"f<g>h|i')]);
-    expect(names.get('u1')).toBe('a_b_c_d_e_f_g_h_i');
+  it('strips the <>:"/\\|?* character set, backslash included', () => {
+    const names = dedupeConversationNames([conv('u1', 'a/b:c*d?e"f<g>h|i\\j')]);
+    expect(names.get('u1')).toBe('a_b_c_d_e_f_g_h_i_j');
+  });
+
+  it('strips a Windows path, which 7-Zip would otherwise treat as folders', () => {
+    expect(safeConversationName('C:\\Users\\report', 'u')).toBe('C__Users_report');
   });
 
   it('collides sanitized names that differ only in stripped characters', () => {
@@ -757,6 +774,12 @@ describe('filenameKey', () => {
     expect(filenameKey(a) === filenameKey(b)).toBe(filenameKey(a + '.md') === filenameKey(b + '.md'));
   });
 
+  it('produces a concrete, composed key', () => {
+    // The relational tests fix only the equivalence, so NFD would satisfy them
+    // all. Pin one actual value.
+    expect(filenameKey(('cafe' + acute).normalize('NFD'))).toBe('CAF\u00C9');
+  });
+
   it('is idempotent', () => {
     for (const name of ['Recipe.md', 'Ca' + acute + 'fe', 'ΟΔΟΣ.md', 'a_1.py']) {
       expect(filenameKey(filenameKey(name))).toBe(filenameKey(name));
@@ -1021,6 +1044,35 @@ describe('language handling', () => {
   });
 });
 
+describe('extractArtifactFiles via the antArtifact text path', () => {
+  // display_content-based fixtures never exercise the artifact sanitizer's
+  // path-separator handling, because extractArtifactsFromMessage already takes
+  // a basename on that route. This one passes the title through verbatim.
+  const fromTag = (attrs) => extractArtifactFiles({
+    name: 'Conv', uuid: 'u1', current_leaf_message_uuid: 'm2',
+    chat_messages: [
+      { uuid: 'm1', sender: 'human', parent_message_uuid: '00000000-0000-0000-0000-000000000000', content: [] },
+      { uuid: 'm2', sender: 'assistant', parent_message_uuid: 'm1', content: [{
+        type: 'text',
+        text: `<antArtifact ${attrs}>print(1)</antArtifact>`,
+      }] },
+    ],
+  }, 'original').map(a => a.filename);
+
+  it('strips a path separator from a tag title', () => {
+    expect(fromTag('title="a/b" language="python"')).toEqual(['a_b.py']);
+  });
+
+  it('strips a backslash from a tag title', () => {
+    expect(fromTag('title="a\\b" language="python"')).toEqual(['a_b.py']);
+  });
+
+  it('does not produce an extension-only dotfile from an empty title', () => {
+    const names = fromTag('title="" language="python"');
+    expect(names[0]).not.toMatch(/^\./);
+  });
+});
+
 describe('uniqueZipPath', () => {
   it('returns the path unchanged when it is free', () => {
     expect(uniqueZipPath(new JSZip(), 'Artifacts/a.md')).toBe('Artifacts/a.md');
@@ -1037,6 +1089,13 @@ describe('uniqueZipPath', () => {
     addZipFile(zip, 'Artifacts/a.md', 'x');
     addZipFile(zip, 'Artifacts/a_1.md', 'y');
     expect(uniqueZipPath(zip, 'Artifacts/a.md')).toBe('Artifacts/a_2.md');
+  });
+
+  it('keeps suffixing past a second collision', () => {
+    // Two bumps is the answer a non-looping implementation also reaches.
+    const zip = new JSZip();
+    for (const path of ['A/a.md', 'A/a_1.md', 'A/a_2.md']) addZipFile(zip, path, 'x');
+    expect(uniqueZipPath(zip, 'A/a.md')).toBe('A/a_3.md');
   });
 
   it('respects filesystem folding, not just exact matches', () => {
@@ -1188,6 +1247,20 @@ describe('reconcileManifest', () => {
     expect(result.ok).toBe(false);
     expect(result.missing.map(m => m.uuid).sort()).toEqual(['u1', 'u2']);
     expect(exportedUuids(entries, result)).toEqual([]);
+  });
+
+  it('ignores paths claimed by a conversation that did not succeed', () => {
+    // A failed attempt records whatever it wrote before throwing. Letting that
+    // contest the successful owner would deny it a timestamp on every run.
+    const zip = new JSZip();
+    zip.file('Report.md', 'x');
+    const entries = [
+      entry({ uuid: 'good', status: 'exported', files: ['Report.md'] }),
+      entry({ uuid: 'bad', status: 'failed', files: ['Report.md'] }),
+    ];
+    const result = reconcileManifest(entries, zip);
+    expect(result.ok).toBe(true);
+    expect(exportedUuids(entries, result)).toEqual(['good']);
   });
 
   it('fires when two conversations claim paths that differ only by folding', () => {
