@@ -17,6 +17,9 @@ const {
   addZipFile,
   uniqueZipPath,
   extractArtifactFiles,
+  filenameKey,
+  getFileExtension,
+  isProgrammingLanguage,
   reconcileManifest,
   exportedUuids,
 } = require('../chrome/utils.js');
@@ -153,10 +156,36 @@ describe('dedupeConversationNames', () => {
   });
 
   it('does not split a surrogate pair when capping', () => {
-    const names = dedupeConversationNames([conv('u1', String.fromCodePoint(0x1f600).repeat(400))]);
+    // The cut must land MID-pair to test anything: one leading ASCII character
+    // makes code-point 100 fall inside an astral character. Asserting
+    // `capped === [...capped].join('')` would be a tautology, so check for an
+    // unpaired surrogate directly.
+    const names = dedupeConversationNames([conv('u1', 'a' + String.fromCodePoint(0x1f600).repeat(200))]);
     const capped = names.get('u1');
-    expect(capped).toBe([...capped].join(''));
-    expect([...capped].length).toBeLessThanOrEqual(100);
+    const loneSurrogate = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+    expect(loneSurrogate.test(capped)).toBe(false);
+    expect([...capped].length).toBe(100);
+  });
+
+  it('caps to exactly the limit, pinning the lower bound too', () => {
+    const names = dedupeConversationNames([conv('u1', 'x'.repeat(400))]);
+    expect([...names.get('u1')].length).toBe(100);
+  });
+
+  it('leaves a name of exactly the limit untouched', () => {
+    const exact = 'y'.repeat(100);
+    expect(dedupeConversationNames([conv('u1', exact)]).get('u1')).toBe(exact);
+  });
+
+  it('strips DEL as well as the C0 controls', () => {
+    const title = 'a' + String.fromCharCode(0x7f) + 'b';
+    expect(dedupeConversationNames([conv('u1', title)]).get('u1')).toBe('a_b');
+  });
+
+  it('trims surrounding whitespace, so a padded title collides with the bare one', () => {
+    const names = dedupeConversationNames([conv('u1', '  Report  '), conv('u2', 'Report')]);
+    expect(names.get('u1')).toBe('Report');
+    expect(names.get('u2')).toBe('Report_1');
   });
 
   it('still separates two over-long titles that share a prefix', () => {
@@ -264,7 +293,7 @@ describe('dedupeConversationNames', () => {
     const names = dedupeConversationNames(conversations);
     // names.size is tautological (the Map is keyed by distinct UUIDs); the
     // content is that no two assigned names collide on a folding filesystem.
-    const keys = [...names.values()].map(n => n.normalize('NFC').toUpperCase());
+    const keys = [...names.values()].map(filenameKey);
     expect(new Set(keys).size).toBe(conversations.length);
   });
 });
@@ -303,6 +332,11 @@ describe('computeRetryDelay', () => {
 
   it('tolerates a padded header', () => {
     expect(computeRetryDelay(429, ' 5 ', 0)).toBe(5000);
+  });
+
+  it('ignores a non-string header rather than coercing it', () => {
+    expect(computeRetryDelay(429, 5, 0)).toBe(1000);
+    expect(computeRetryDelay(429, { toString: () => '30' }, 0)).toBe(1000);
   });
 
   it('rejects a negative header', () => {
@@ -635,6 +669,46 @@ describe('fetchWithBackoff', () => {
   });
 });
 
+describe('filenameKey', () => {
+  const acute = String.fromCharCode(0x301);
+
+  it('folds case', () => {
+    expect(filenameKey('Recipe.md')).toBe(filenameKey('recipe.MD'));
+  });
+
+  it('folds canonical normalization', () => {
+    expect(filenameKey(('Cafe' + acute).normalize('NFC'))).toBe(filenameKey(('Cafe' + acute).normalize('NFD')));
+  });
+
+  it('is compositional: appending an extension cannot change whether two names agree', () => {
+    // The property toLowerCase lacks, via Final_Sigma.
+    const a = 'O' + String.fromCharCode(0x394) + 'O' + String.fromCharCode(0x3a3);
+    const b = 'O' + String.fromCharCode(0x394) + 'O' + String.fromCharCode(0x3c3);
+    expect(filenameKey(a) === filenameKey(b)).toBe(filenameKey(a + '.md') === filenameKey(b + '.md'));
+  });
+
+  it('is idempotent', () => {
+    for (const name of ['Recipe.md', 'Ca' + acute + 'fe', 'ΟΔΟΣ.md', 'a_1.py']) {
+      expect(filenameKey(filenameKey(name))).toBe(filenameKey(name));
+    }
+  });
+
+  it('does not merge compatibility equivalents that are distinct files', () => {
+    // NFKC would fold these together; NFC must not.
+    expect(filenameKey('\uFF41.md')).not.toBe(filenameKey('a.md'));
+  });
+
+  it('is the equivalence every consumer uses', () => {
+    // If a consumer disagreed with this, a rename in one namespace could
+    // collide in another — which is how the Main.py/main.py failure happened.
+    const zip = new JSZip();
+    addZipFile(zip, 'Note.md', 'x');
+    expect(() => addZipFile(zip, 'note.MD', 'y')).toThrow();
+    expect(uniqueZipPath(zip, 'note.MD')).not.toBe('note.MD');
+    expect(dedupeConversationNames([conv('u1', 'Note'), conv('u2', 'note')]).get('u2')).toBe('note_1');
+  });
+});
+
 describe('createPacer', () => {
   it('starts with no deadline, so the first request is not delayed', () => {
     expect(createPacer(200)).toEqual({ intervalMs: 200, notBefore: 0 });
@@ -722,6 +796,15 @@ describe('addZipFile', () => {
     expect(() => addZipFile(zip, 'a.md', 'x')).toThrow(/Duplicate ZIP entry/);
   });
 
+  it('catches a raw write made after the index was seeded', () => {
+    // The seed only runs once, so a later raw write — the manifest is one — is
+    // covered by the exact-match cross-check and nothing else.
+    const zip = new JSZip();
+    addZipFile(zip, 'first.md', 'x');
+    zip.file('export-manifest.json', '{}');
+    expect(() => addZipFile(zip, 'export-manifest.json', 'y')).toThrow(/Duplicate ZIP entry/);
+  });
+
   it('keeps its written-path index per ZIP, not globally', () => {
     const first = new JSZip();
     const second = new JSZip();
@@ -751,6 +834,19 @@ describe('extractArtifactFiles robustness', () => {
       ],
     };
     expect(() => extractArtifactFiles(data, 'original')).not.toThrow();
+  });
+});
+
+describe('language handling', () => {
+  it('matches a capitalized language name', () => {
+    expect(getFileExtension('Python')).toBe('.py');
+    expect(isProgrammingLanguage('TypeScript')).toBe(true);
+  });
+
+  it('ignores a non-string language rather than throwing', () => {
+    expect(() => getFileExtension(42)).not.toThrow();
+    expect(() => isProgrammingLanguage(42)).not.toThrow();
+    expect(getFileExtension(42)).toBe('.txt');
   });
 });
 
@@ -788,6 +884,19 @@ describe('uniqueZipPath', () => {
     expect(() => addZipFile(zip, second, 'b')).not.toThrow();
   });
 
+  it('sees an archive entry that predates any guarded write', () => {
+    const zip = new JSZip();
+    zip.file('notes.md', 'raw');
+    expect(uniqueZipPath(zip, 'notes.md')).toBe('notes_1.md');
+  });
+
+  it('sees a raw entry added after the index was seeded', () => {
+    const zip = new JSZip();
+    addZipFile(zip, 'a.md', 'x');
+    zip.file('b.md', 'raw');
+    expect(uniqueZipPath(zip, 'b.md')).toBe('b_1.md');
+  });
+
   it('does not treat a dot inside a folder name as an extension', () => {
     const zip = new JSZip();
     addZipFile(zip, 'v1.2/a', 'x');
@@ -817,7 +926,7 @@ describe('extractArtifactFiles filename dedup', () => {
   it('separates artifact filenames differing only in case', () => {
     const names = namesFor('Main.py', 'main.py');
     expect(names).toHaveLength(2);
-    expect(new Set(names.map(n => n.toLowerCase())).size).toBe(2);
+    expect(new Set(names.map(filenameKey)).size).toBe(2);
   });
 
   it('separates artifact filenames differing only in normalization', () => {
@@ -825,7 +934,7 @@ describe('extractArtifactFiles filename dedup', () => {
     const base = 'cafe' + combiningAcute + '.py';
     const names = namesFor(base.normalize('NFC'), base.normalize('NFD'));
     expect(names).toHaveLength(2);
-    expect(new Set(names.map(n => n.normalize('NFC').toLowerCase())).size).toBe(2);
+    expect(new Set(names.map(filenameKey)).size).toBe(2);
   });
 
   it('assigns the exact deduplicated names, not merely distinct ones', () => {
@@ -861,9 +970,19 @@ describe('extractArtifactFiles filename dedup', () => {
     }
   });
 
+  it('caps an over-long artifact filename', () => {
+    const names = namesFor('z'.repeat(400) + '.py');
+    expect([...names[0]].length).toBeLessThanOrEqual(104);
+  });
+
   it('strips control characters from artifact filenames', () => {
     const names = namesFor('we' + String.fromCharCode(9) + 'ird.py');
     expect(names[0]).not.toContain(String.fromCharCode(9));
+  });
+
+  it('strips DEL from artifact filenames too', () => {
+    const names = namesFor('we' + String.fromCharCode(0x7f) + 'ird.py');
+    expect(names[0]).not.toContain(String.fromCharCode(0x7f));
   });
 });
 
@@ -886,17 +1005,29 @@ describe('reconcileManifest', () => {
     expect(result.missing[0].uuid).toBe('u1');
   });
 
-  it('cannot detect an overwrite on its own — addZipFile is that defence', () => {
-    // Documents a real blind spot rather than covering it: if two entries claim
-    // the same path, the archive genuinely holds that path, so reconciliation
-    // passes. Only addZipFile can catch this, at the moment of the second write.
+  it('fires when two conversations claim the same path', () => {
+    // One file cannot be two successes, however many entries say they wrote it.
     const zip = new JSZip();
     zip.file('Recipe.md', 'second wins');
     const entries = [
       entry({ uuid: 'u1', files: ['Recipe.md'] }),
       entry({ uuid: 'u2', files: ['Recipe.md'] }),
     ];
-    expect(reconcileManifest(entries, zip).ok).toBe(true);
+    const result = reconcileManifest(entries, zip);
+    expect(result.ok).toBe(false);
+    expect(result.missing.map(m => m.uuid).sort()).toEqual(['u1', 'u2']);
+    expect(exportedUuids(entries, result)).toEqual([]);
+  });
+
+  it('fires when two conversations claim paths that differ only by folding', () => {
+    const zip = new JSZip();
+    zip.file('Recipe.md', 'a');
+    zip.file('recipe.md', 'b');
+    const entries = [
+      entry({ uuid: 'u1', files: ['Recipe.md'] }),
+      entry({ uuid: 'u2', files: ['recipe.md'] }),
+    ];
+    expect(reconcileManifest(entries, zip).ok).toBe(false);
   });
 
   it('reports an exported entry with no files property at all', () => {
@@ -911,6 +1042,17 @@ describe('reconcileManifest', () => {
     const result = reconcileManifest([entry({ files: ['missing.md', 'present.md'] })], zip);
     expect(result.ok).toBe(false);
     expect(result.missing[0].reason).toContain('missing.md');
+  });
+
+  it('fires when an entry claims two paths that differ only by folding', () => {
+    // Both spellings really are in the archive, so a presence check passes and
+    // an unfolded duplicate check passes; only a folded one catches it.
+    const zip = new JSZip();
+    zip.file('Notes.md', 'a');
+    zip.file('notes.md', 'b');
+    const result = reconcileManifest([entry({ files: ['Notes.md', 'notes.md'] })], zip);
+    expect(result.ok).toBe(false);
+    expect(result.missing[0].reason).toMatch(/same path more than once/);
   });
 
   it('fires when an entry claims the same path twice', () => {

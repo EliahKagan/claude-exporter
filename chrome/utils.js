@@ -1280,8 +1280,30 @@ function addZipFile(zip, path, content) {
 function reconcileManifest(entries, zip) {
   const missing = [];
 
+  // Two entries claiming the same path is one file, however many conversations
+  // say they wrote it. addZipFile normally prevents this; checking here as well
+  // means a write that somehow bypassed it still cannot pass as two successes.
+  const owners = new Map();
   for (const entry of entries) {
     if (entry.status !== 'exported') continue;
+    for (const path of entry.files || []) {
+      const key = filenameKey(path);
+      if (!owners.has(key)) owners.set(key, []);
+      owners.get(key).push(entry.uuid);
+    }
+  }
+  const contested = new Set();
+  for (const [, uuids] of owners) {
+    if (new Set(uuids).size > 1) uuids.forEach(uuid => contested.add(uuid));
+  }
+
+  for (const entry of entries) {
+    if (entry.status !== 'exported') continue;
+
+    if (contested.has(entry.uuid)) {
+      missing.push({ uuid: entry.uuid, title: entry.title, reason: 'claims a path another conversation also claims' });
+      continue;
+    }
 
     const files = entry.files || [];
     if (files.length === 0) {
