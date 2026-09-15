@@ -251,7 +251,69 @@ function downloadFile(content, filename, type = 'application/json') {
 // ============================================================================
 
 // Extract artifacts from message content (supports both old and new formats)
-function extractArtifactsFromMessage(message) {
+// The artifacts tool identifies an artifact's kind by a MIME-ish `type`. Only
+// `application/vnd.ant.code` carries a separate `language`; for the rest the type
+// implies one, and the filename and format conversion downstream want the
+// language, not the type.
+const ARTIFACT_TYPE_LANGUAGES = {
+  'text/markdown': 'markdown',
+  'text/html': 'html',
+  'image/svg+xml': 'svg',
+  'application/vnd.ant.code': '',
+  'application/vnd.ant.react': 'jsx',
+  'application/vnd.ant.mermaid': 'mermaid',
+};
+
+// A `rewrite` call carries only the new body and the artifact's id — no title,
+// type or language — so those are taken from whichever call first declared them
+// for the same id. Without this the rewritten versions all land as `artifact.md`.
+function collectArtifactMeta(messages) {
+  const meta = new Map();
+
+  for (const message of messages) {
+    for (const content of (message.content || [])) {
+      if (content.type !== 'tool_use') continue;
+      if (content.name !== 'artifacts' && content.name !== 'create_file') continue;
+
+      const input = content.input;
+      if (!input || !input.id) continue;
+
+      const known = meta.get(input.id) || {};
+      // First declaration wins: a later call that omits a field must not erase it.
+      if (!known.title && input.title) known.title = input.title;
+      if (!known.type && input.type) known.type = input.type;
+      if (!known.language && input.language) known.language = input.language;
+      meta.set(input.id, known);
+    }
+  }
+
+  return meta;
+}
+
+// Builds an artifact from the tool call's own arguments. `update` calls are
+// deliberately not handled: they carry an old_str/new_str patch rather than a
+// body, and every artifact whose only calls are patches has no rendered base to
+// apply them to, so there is nothing to reconstruct.
+function artifactFromToolInput(input, artifactMeta) {
+  if (!input || typeof input.content !== 'string' || input.content === '') return null;
+
+  const known = (artifactMeta && input.id && artifactMeta.get(input.id)) || {};
+  const language = input.language
+    || ARTIFACT_TYPE_LANGUAGES[input.type]
+    || known.language
+    || ARTIFACT_TYPE_LANGUAGES[known.type]
+    || 'txt';
+
+  return {
+    title: input.title || known.title || 'Untitled',
+    language,
+    type: isProgrammingLanguage(language) ? 'code' : 'document',
+    identifier: input.id || null,
+    content: input.content.trim(),
+  };
+}
+
+function extractArtifactsFromMessage(message, artifactMeta) {
   const artifacts = [];
 
   // Check if message has content array (new format)
@@ -266,9 +328,11 @@ function extractArtifactsFromMessage(message) {
       //     display_content shape (language / code / filename).
       // bash, web_search, repl, view, list_directory, etc. are filtered out.
       if (content.type === 'tool_use' &&
-          (content.name === 'artifacts' || content.name === 'create_file') &&
-          content.display_content) {
-        const displayContent = content.display_content;
+          (content.name === 'artifacts' || content.name === 'create_file')) {
+        const before = artifacts.length;
+        // Defaulted rather than guarded, so the checks below simply miss when the
+        // call carries no rendering and the input fallback gets its turn.
+        const displayContent = content.display_content || {};
 
         // Check for code_block format (newer artifact format)
         if (displayContent.type === 'code_block' && displayContent.code) {
@@ -313,6 +377,19 @@ function extractArtifactsFromMessage(message) {
           } catch (e) {
             // JSON parse failed, skip this artifact
             console.warn('Failed to parse artifact json_block:', e);
+          }
+        }
+
+        // display_content is a rendering claude.ai attaches for the UI, and it
+        // is sometimes absent and sometimes truncated at 64 KiB. The tool call
+        // itself holds the artifact body, so fall back to it. Measured against a
+        // real 2725-conversation export: 85 of 370 artifacts had no usable
+        // display_content and 82 of them had their full body right here, none of
+        // which was written and none of which was reported.
+        if (artifacts.length === before) {
+          const fromInput = artifactFromToolInput(content.input, artifactMeta);
+          if (fromInput) {
+            artifacts.push(fromInput);
           }
         }
       }
@@ -654,9 +731,10 @@ function extractArtifactFiles(data, artifactFormat = 'original') {
 
   // Get only the current branch messages
   const branchMessages = getCurrentBranch(data);
+  const artifactMeta = collectArtifactMeta(branchMessages);
 
   for (const message of branchMessages) {
-    const artifacts = extractArtifactsFromMessage(message);
+    const artifacts = extractArtifactsFromMessage(message, artifactMeta);
 
     for (const artifact of artifacts) {
       // Generate filename from title and language
@@ -1472,6 +1550,8 @@ if (typeof module !== 'undefined' && module.exports) {
     fetchWithBackoff,
     addZipFile,
     toZipBytes,
+    collectArtifactMeta,
+    artifactFromToolInput,
     uniqueZipPath,
     reconcileManifest,
     assertConversationShape,

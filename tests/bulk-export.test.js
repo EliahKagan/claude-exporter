@@ -16,6 +16,8 @@ const {
   fetchWithBackoff,
   addZipFile,
   toZipBytes,
+  collectArtifactMeta,
+  artifactFromToolInput,
   uniqueZipPath,
   extractArtifactFiles,
   filenameKey,
@@ -1131,6 +1133,156 @@ describe('extractArtifactFiles robustness', () => {
       ],
     };
     expect(() => extractArtifactFiles(data, 'original')).not.toThrow();
+  });
+});
+
+describe('artifact extraction from the tool call input', () => {
+  // display_content is a rendering claude.ai attaches for the UI; it is absent on
+  // some calls and truncated at 64 KiB on others. The body is in the call itself.
+  const fromBlocks = (blocks) => extractArtifactFiles({
+    name: 'Conv', uuid: 'u1', current_leaf_message_uuid: 'm2',
+    chat_messages: [
+      { uuid: 'm1', sender: 'human', parent_message_uuid: '00000000-0000-0000-0000-000000000000', content: [] },
+      { uuid: 'm2', sender: 'assistant', parent_message_uuid: 'm1', content: blocks },
+    ],
+  }, 'original');
+
+  const call = (input, display_content) => ({
+    type: 'tool_use', name: 'artifacts', input, ...(display_content ? { display_content } : {}),
+  });
+
+  it('writes an artifact whose call carries no display_content at all', () => {
+    const files = fromBlocks([call({
+      command: 'create', id: 'a1', title: 'Notes', type: 'text/markdown', content: '# hi',
+    })]);
+    expect(files).toEqual([{ filename: 'Notes.md', content: '# hi' }]);
+  });
+
+  it('writes an artifact whose json_block was truncated mid-string', () => {
+    // A 64 KiB cut leaves unparseable JSON; previously this was warned about and
+    // dropped, taking the artifact with it even though the body was right there.
+    const truncated = '{"filename":"a.py","language":"python","code":"print(1';
+    const files = fromBlocks([call(
+      { command: 'create', id: 'a1', title: 'Script', type: 'application/vnd.ant.code', language: 'python', content: 'print(1)' },
+      { type: 'json_block', json_block: truncated },
+    )]);
+    expect(files).toEqual([{ filename: 'Script.py', content: 'print(1)' }]);
+  });
+
+  it('prefers display_content and does not also write the input copy', () => {
+    const files = fromBlocks([call(
+      { command: 'create', id: 'a1', title: 'Ignored', type: 'text/markdown', content: 'from input' },
+      { type: 'code_block', code: 'from display', language: 'python', filename: 'shown.py' },
+    )]);
+    expect(files).toEqual([{ filename: 'shown.py', content: 'from display' }]);
+  });
+
+  it('writes nothing for an update that carries only a patch', () => {
+    // No body to write, and an artifact whose only calls are patches has no
+    // rendered base to apply them to, so there is nothing to reconstruct.
+    expect(fromBlocks([call({ command: 'update', id: 'a1', old_str: 'a', new_str: 'b' })])).toEqual([]);
+  });
+
+  it('gives a rewrite the title its create declared', () => {
+    // A rewrite call carries only the new body and the id.
+    const files = fromBlocks([
+      call({ command: 'create', id: 'a1', title: 'Report', type: 'text/markdown', content: 'v1' }),
+      call({ command: 'rewrite', id: 'a1', content: 'v2' }),
+    ]);
+    expect(files.map(f => f.filename)).toEqual(['Report.md', 'Report_1.md']);
+    expect(files.map(f => f.content)).toEqual(['v1', 'v2']);
+  });
+
+  it('derives the extension from the type when no language is given', () => {
+    const byType = (type) => fromBlocks([call({
+      command: 'create', id: 'a1', title: 'T', type, content: 'x',
+    })])[0].filename;
+    expect(byType('text/markdown')).toBe('T.md');
+    expect(byType('text/html')).toBe('T.html');
+    expect(byType('image/svg+xml')).toBe('T.svg');
+  });
+
+  it('uses the explicit language for a code artifact, whose type implies none', () => {
+    const files = fromBlocks([call({
+      command: 'create', id: 'a1', title: 'T', type: 'application/vnd.ant.code',
+      language: 'rust', content: 'fn main() {}',
+    })]);
+    expect(files[0].filename).toBe('T.rs');
+  });
+
+  it('falls back to .txt rather than producing an extensionless name', () => {
+    const files = fromBlocks([call({ command: 'create', id: 'a1', title: 'T', content: 'x' })]);
+    expect(files[0].filename).toBe('T.txt');
+  });
+
+  it('trims the body, matching the display_content path', () => {
+    const files = fromBlocks([call({
+      command: 'create', id: 'a1', title: 'T', type: 'text/markdown', content: '\n  body  \n',
+    })]);
+    expect(files[0].content).toBe('body');
+  });
+});
+
+describe('artifactFromToolInput', () => {
+  it('refuses a call with no body', () => {
+    expect(artifactFromToolInput({ command: 'update', id: 'a', old_str: 'x', new_str: 'y' })).toBeNull();
+    expect(artifactFromToolInput({ command: 'create', id: 'a', content: '' })).toBeNull();
+    expect(artifactFromToolInput(null)).toBeNull();
+    expect(artifactFromToolInput(undefined)).toBeNull();
+  });
+
+  it('refuses a body that is not a string', () => {
+    expect(artifactFromToolInput({ command: 'create', id: 'a', content: { code: 'x' } })).toBeNull();
+  });
+
+  it('names an artifact Untitled only when no call ever declared a title', () => {
+    expect(artifactFromToolInput({ command: 'rewrite', id: 'a', content: 'x' }).title).toBe('Untitled');
+  });
+
+  it('prefers the call\'s own language over the one its type implies', () => {
+    const a = artifactFromToolInput({
+      command: 'create', id: 'a', type: 'text/markdown', language: 'python', content: 'x',
+    });
+    expect(a.language).toBe('python');
+  });
+
+  it('classifies a markdown artifact as a document and a code one as code', () => {
+    expect(artifactFromToolInput({ command: 'create', id: 'a', type: 'text/markdown', content: 'x' }).type)
+      .toBe('document');
+    expect(artifactFromToolInput({ command: 'create', id: 'a', type: 'application/vnd.ant.code', language: 'rust', content: 'x' }).type)
+      .toBe('code');
+  });
+});
+
+describe('collectArtifactMeta', () => {
+  const msg = (blocks) => ({ content: blocks });
+  const call = (input) => ({ type: 'tool_use', name: 'artifacts', input });
+
+  it('keeps a title declared earlier when a later call omits it', () => {
+    const meta = collectArtifactMeta([
+      msg([call({ command: 'create', id: 'a1', title: 'Kept', type: 'text/markdown' })]),
+      msg([call({ command: 'rewrite', id: 'a1' })]),
+    ]);
+    expect(meta.get('a1')).toEqual({ title: 'Kept', type: 'text/markdown' });
+  });
+
+  it('does not let a second artifact inherit the first one\'s title', () => {
+    const meta = collectArtifactMeta([
+      msg([call({ command: 'create', id: 'a1', title: 'One' })]),
+      msg([call({ command: 'create', id: 'a2', content: 'x' })]),
+    ]);
+    expect(meta.get('a2')).toEqual({});
+  });
+
+  it('ignores tool calls that are not artifact producers', () => {
+    const meta = collectArtifactMeta([
+      msg([{ type: 'tool_use', name: 'web_search', input: { id: 'w1', title: 'Search' } }]),
+    ]);
+    expect(meta.has('w1')).toBe(false);
+  });
+
+  it('tolerates a message with no content array', () => {
+    expect(() => collectArtifactMeta([{ uuid: 'm1' }])).not.toThrow();
   });
 });
 
