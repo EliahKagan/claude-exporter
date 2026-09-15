@@ -19,6 +19,7 @@ const {
   extractArtifactFiles,
   filenameKey,
   safeConversationName,
+  assertConversationShape,
   getCurrentBranch,
   getFileExtension,
   isProgrammingLanguage,
@@ -142,14 +143,26 @@ describe('dedupeConversationNames', () => {
   });
 
   it.each([
+    ['capital I with dot', String.fromCharCode(0x130), 'i' + String.fromCharCode(0x307)],
+    ['iota with dialytika tonos', String.fromCharCode(0x390),
+      String.fromCharCode(0x399, 0x308, 0x301)],
+    ['upsilon with dialytika tonos', String.fromCharCode(0x3b0),
+      String.fromCharCode(0x3a5, 0x308, 0x301)],
+    ['sharp s', String.fromCharCode(0xdf), String.fromCharCode(0x1e9e)],
+    ['theta', String.fromCharCode(0x398), String.fromCharCode(0x3f4)],
+    ['theta symbol', String.fromCharCode(0x3b8), String.fromCharCode(0x3d1)],
     ['long s', 's', String.fromCharCode(0x17f)],
     ['micro sign', String.fromCharCode(0xb5), String.fromCharCode(0x3bc)],
     ['final sigma', String.fromCharCode(0x3c3), String.fromCharCode(0x3c2)],
     ['beta symbol', String.fromCharCode(0x3b2), String.fromCharCode(0x3d0)],
     ['st ligature', String.fromCharCode(0xfb05), String.fromCharCode(0xfb06)],
-  ])('treats %s variants as colliding, as a case-insensitive filesystem does', (_label, a, b) => {
+  ])('folds %s variants together, as the filesystem does', (_label, a, b) => {
+    // Asserting only that the two names differ would be vacuous: the dedup
+    // always produces distinct names. The property is that these two are
+    // treated as the SAME name, so one of them gets renamed.
+    expect(filenameKey(a)).toBe(filenameKey(b));
     const names = dedupeConversationNames([conv('u1', a), conv('u2', b)]);
-    expect(names.get('u1')).not.toBe(names.get('u2'));
+    expect(names.get('u2')).toMatch(/_1$/);
   });
 
   it('caps a name so one long title cannot abort the whole extraction', () => {
@@ -828,6 +841,29 @@ describe('safeConversationName', () => {
     const title = 'Plan/2025: "final"';
     expect(dedupeConversationNames([conv('u1', title)]).get('u1'))
       .toBe(safeConversationName(title, 'u1'));
+  });
+});
+
+describe('assertConversationShape', () => {
+  it('accepts a real conversation, including an empty one', () => {
+    expect(() => assertConversationShape({ uuid: 'u', chat_messages: [] })).not.toThrow();
+    expect(() => assertConversationShape({ uuid: 'u', chat_messages: [{ uuid: 'm' }] })).not.toThrow();
+  });
+
+  it.each([
+    ['an error object', { error: { message: 'boom' } }],
+    ['a bare string', 'Internal Server Error'],
+    ['a number', 42],
+    ['an array', []],
+    ['null', null],
+    ['a conversation with no messages array', { uuid: 'u' }],
+  ])('rejects %s, which a 200 can still carry', (_label, body) => {
+    expect(() => assertConversationShape(body)).toThrow(/not a conversation/);
+  });
+
+  it('rejects a payload the API says is truncated', () => {
+    expect(() => assertConversationShape({ uuid: 'u', chat_messages: [], truncated: true }))
+      .toThrow(/truncated/);
   });
 });
 

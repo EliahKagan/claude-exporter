@@ -26,10 +26,12 @@ function recordExportTimestamp(conversationId) {
 // Record export timestamps for multiple conversations
 // Mirrors browse.js: merge into what storage currently holds and report a
 // failed write, rather than dropping it silently.
-function recordExportTimestamps(conversationIds) {
+function recordExportTimestamps(conversationIds, exportedAt) {
   chrome.storage.local.get(['exportTimestamps'], (result) => {
     const timestamps = result.exportTimestamps || {};
-    const now = new Date().toISOString();
+    // See browse.js: stamped with the run's start, not its end, so a
+    // conversation edited during a long run is not marked already-exported.
+    const now = exportedAt || new Date().toISOString();
     for (const id of conversationIds) {
       timestamps[id] = now;
     }
@@ -352,6 +354,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         ]);
 
         const pacer = createPacer(500);
+        const runStartedAt = new Date().toISOString();
 
         // Shared tail for both export shapes.
         const finishExport = async (zip, prefix) => {
@@ -395,7 +398,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
           // Only conversations whose files are provably in the archive get a
           // timestamp; anything else stays flagged as new on the next run.
-          recordExportTimestamps(reconciledIds);
+          recordExportTimestamps(reconciledIds, runStartedAt);
 
           // Reported through the popup's existing warnings channel rather than
           // alert(): a content script's alert is tab-modal, is deferred while
@@ -431,6 +434,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               processed++;
               console.log(`Scanning conversation ${processed}/${conversations.length}: ${conv.name || conv.uuid}`);
               const fullConv = await fetchConversation(request.orgId, conv.uuid, pacer);
+              assertConversationShape(fullConv);
 
               // Infer model if null
               fullConv.model = inferModel(fullConv);
@@ -553,6 +557,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               processed++;
               console.log(`Fetching full conversation ${processed}/${conversations.length}: ${conv.uuid}`);
               const fullConv = await fetchConversation(request.orgId, conv.uuid, pacer);
+              assertConversationShape(fullConv);
 
               // Infer model if null
               fullConv.model = inferModel(fullConv);

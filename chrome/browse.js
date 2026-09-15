@@ -102,8 +102,13 @@ function getDisplayModel(conv) {
 // it runs after the archive has already downloaded, so a storage failure must
 // be reported without derailing the rest of the reporting. Returns whether the
 // write actually landed.
-async function persistExportTimestamps(conversationIds) {
-  const now = new Date().toISOString();
+async function persistExportTimestamps(conversationIds, exportedAt) {
+  // Defaults to now, but a bulk run passes the time it STARTED. Stamping the
+  // end of a run that can take hours would mark a conversation edited while it
+  // ran as already exported — isNewOrUpdated compares updated_at against this
+  // — and it would never resurface. Stamping the start over-reports "new" at
+  // worst, which costs a re-export rather than the conversation.
+  const now = exportedAt || new Date().toISOString();
   return new Promise((resolve) => {
     let settled = false;
     const done = (ok, error) => {
@@ -147,8 +152,8 @@ async function saveExportTimestamp(conversationId) {
   return persistExportTimestamps([conversationId]);
 }
 
-async function saveExportTimestamps(conversationIds) {
-  return persistExportTimestamps(conversationIds);
+async function saveExportTimestamps(conversationIds, exportedAt) {
+  return persistExportTimestamps(conversationIds, exportedAt);
 }
 
 async function loadDateTimePrefs() {
@@ -715,6 +720,7 @@ async function exportConversation(conversationId, conversationName) {
     }
 
     const data = await response.json();
+    assertConversationShape(data);
 
     // Infer model if null
     data.model = inferModel(data);
@@ -948,6 +954,7 @@ async function exportAllFiltered() {
     ]);
 
     const pacer = createPacer(200);
+    const runStartedAt = new Date().toISOString();
 
     progressText.textContent = `Exporting ${total} conversations...`;
 
@@ -975,6 +982,7 @@ async function exportAllFiltered() {
         }
 
         const data = await response.json();
+        assertConversationShape(data);
 
         // Infer model if null
         data.model = inferModel(data);
@@ -1165,7 +1173,7 @@ async function exportAllFiltered() {
     // Record export timestamps only for conversations whose files are provably
     // in the archive, so a failed or clobbered conversation stays flagged as
     // new on the next run.
-    const saved = await saveExportTimestamps(reconciledIds);
+    const saved = await saveExportTimestamps(reconciledIds, runStartedAt);
     displayConversations();
     updateStats();
 

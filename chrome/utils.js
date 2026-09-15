@@ -577,16 +577,31 @@ function convertArtifactFormat(content, language, baseFilename, format) {
 // Unicode, so two archive entries differing only in those ways collapse into
 // one on extraction. Every place that decides whether two names collide must
 // use this, or the producers and the guard disagree.
+// Characters whose uppercase is not their canonical capital, so upper-casing
+// alone cannot merge them with the partner a filesystem folds them onto.
+const FOLD_SINGLETONS = [
+  [/\u1E9E/g, '\u00DF'],   // capital sharp s -> small sharp s, which uppercases to SS
+  [/\u03F4/g, '\u0398'],   // capital theta symbol -> capital theta
+];
+
 function filenameKey(name) {
   // toUpperCase, not toLowerCase: lowercasing applies Unicode's Final_Sigma
   // context rule, so a name ending in a sigma keys differently on its own than
   // it does once an extension is appended. The conversation dedup keys a bare
   // name and the ZIP guard keys a full path, so that made them disagree and a
   // conversation could fail on every run forever. Upper-casing has no such
-  // context rule, and it merges 20 of the 21 BMP groups that collapse on a
-  // case-insensitive filesystem but survive lowercasing. Over-merging is the
-  // safe direction: it renames, it never silently combines two conversations.
-  return name.normalize('NFC').toUpperCase();
+  // context rule. Over-merging is the safe direction: it renames, it never
+  // silently combines two conversations.
+  //
+  // Normalized again afterwards because upper-casing denormalizes — the
+  // precomposed forms of iota and upsilon with diacritics expand into base
+  // plus combining marks, which a filesystem folds back together and a single
+  // NFC pass does not.
+  let folded = name;
+  for (const [pattern, replacement] of FOLD_SINGLETONS) {
+    folded = folded.replace(pattern, replacement);
+  }
+  return folded.normalize('NFC').toUpperCase().normalize('NFC');
 }
 
 // Characters that are legal in a JS string and in a ZIP entry name but not in
@@ -1096,6 +1111,21 @@ function generateDiagnostics(onComplete) {
 
 // ----- Bulk export helpers -----
 
+// A 200 is not proof the body is a conversation. An error object, a bare
+// string, or an array all survive JSON.parse and then produce a header-only
+// stub that reconciles clean and is recorded as exported. The
+// single-conversation handler has always checked this; the bulk loops did not.
+function assertConversationShape(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data) || !Array.isArray(data.chat_messages)) {
+    throw new Error('Response was not a conversation');
+  }
+  if (data.truncated) {
+    // The API is telling us the payload it just returned is incomplete.
+    // Exporting it as a complete success is exactly the claim we must not make.
+    throw new Error('Conversation was truncated by the API');
+  }
+}
+
 // Reserved ZIP entry name for the per-run export manifest. Both forms are
 // reserved against conversation titles: the basename covers a conversation
 // titled "export-manifest" exported as JSON, the full name covers one titled
@@ -1405,6 +1435,7 @@ if (typeof module !== 'undefined' && module.exports) {
     addZipFile,
     uniqueZipPath,
     reconcileManifest,
+    assertConversationShape,
     safeConversationName,
     filenameKey,
     exportedUuids,
