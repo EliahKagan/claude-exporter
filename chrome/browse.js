@@ -250,31 +250,66 @@ async function loadOrgId() {
 }
 
 // Helper function to find a claude.ai tab and send a message
+// How long to wait for a claude.ai tab to answer. A content script that keeps
+// the message channel open and never responds produces no error at all, so
+// without this the page waits forever showing only a spinner.
+const RELAY_TIMEOUT_MS = 10000;
+
+// Prefers a tab that can actually answer: loaded, and not discarded by
+// Chrome's memory saver. The old code took tabs[0] across every window, so an
+// asleep or still-loading tab could be picked purely on window ordering.
+// Window preference is handled by the caller's first query, not here.
+function pickClaudeTab(tabs) {
+  const ready = tabs.filter(tab => !tab.discarded && tab.status === 'complete');
+  return ready[0] || tabs[0];
+}
+
 function sendMessageToClaudeTab(action, data) {
   return new Promise((resolve, reject) => {
-    // Find a claude.ai tab using callback
-    chrome.tabs.query({ url: 'https://claude.ai/*' }, (tabs) => {
-      if (chrome.runtime.lastError) {
-        reject(new Error(chrome.runtime.lastError.message));
+    // Current window first, then anywhere: the browse page opens in whichever
+    // window the popup was clicked from, so the claude.ai tab is normally a
+    // sibling — but it may have been dragged elsewhere, and that used to work.
+    chrome.tabs.query({ url: 'https://claude.ai/*', currentWindow: true }, (here) => {
+      if (!chrome.runtime.lastError && here && here.length > 0) {
+        send(here);
         return;
       }
-
-      if (!tabs || tabs.length === 0) {
-        reject(new Error('Please open a claude.ai tab first to use this feature'));
-        return;
-      }
-
-      // Send message to the first claude.ai tab
-      chrome.tabs.sendMessage(tabs[0].id, { action, ...data }, (response) => {
+      chrome.tabs.query({ url: 'https://claude.ai/*' }, (anywhere) => {
         if (chrome.runtime.lastError) {
           reject(new Error(chrome.runtime.lastError.message));
-        } else if (response && response.success) {
-          resolve(response);
-        } else {
-          reject(new Error(response?.error || 'Request failed'));
+          return;
         }
+        if (!anywhere || anywhere.length === 0) {
+          reject(new Error('Please open a claude.ai tab first to use this feature'));
+          return;
+        }
+        send(anywhere);
       });
     });
+
+    function send(tabs) {
+      let settled = false;
+      const finish = (fn, value) => {
+        if (settled) return;
+        settled = true;
+        fn(value);
+      };
+
+      const timer = setTimeout(() => finish(reject, new Error(
+        `The claude.ai tab did not respond within ${RELAY_TIMEOUT_MS / 1000}s. Reload it and try again.`
+      )), RELAY_TIMEOUT_MS);
+
+      chrome.tabs.sendMessage(pickClaudeTab(tabs).id, { action, ...data }, (response) => {
+        clearTimeout(timer);
+        if (chrome.runtime.lastError) {
+          finish(reject, new Error(chrome.runtime.lastError.message));
+        } else if (response && response.success) {
+          finish(resolve, response);
+        } else {
+          finish(reject, new Error(response?.error || 'Request failed'));
+        }
+      });
+    }
   });
 }
 
