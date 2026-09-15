@@ -474,7 +474,7 @@ function isProgrammingLanguage(language) {
     'f#', 'c#', 'csharp', 'objective-c', 'ocaml', 'scheme', 'lisp', 'fortran',
     'assembly', 'asm', 'groovy', 'html', 'css', 'scss', 'sass', 'less', 'stylus'
   ];
-  return programmingLanguages.includes(language.toLowerCase());
+  return programmingLanguages.includes(String(language || '').toLowerCase());
 }
 
 // Convert artifact content and filename based on selected format
@@ -579,11 +579,13 @@ function filenameKey(name) {
   return name.normalize('NFC').toUpperCase();
 }
 
-// Per-component cap. APFS and NTFS reject components over 255 characters, and
-// ditto aborts the whole extraction when it hits one, so an over-long name
+// Per-component cap. APFS and NTFS reject components over 255 UTF-16 units and
+// ditto aborts the entire extraction on the first one, so an over-long name
 // takes unrelated conversations down with it. Flat mode joins two capped names
-// into one path, hence a cap comfortably under half the limit.
-const MAX_NAME_CHARS = 120;
+// with an underscore, and suffixes and an extension are appended after the cap,
+// so the bound that matters is 2N + (dedup suffix) + (artifact suffix) +
+// (separator) + (extension) <= 255. At N = 100 that is about 220.
+const MAX_NAME_CHARS = 100;
 
 function capNameLength(name) {
   const chars = [...name];   // by code point, so a surrogate pair is never split
@@ -1090,11 +1092,14 @@ function dedupeConversationNames(conversations, reservedNames = []) {
   // producing a file called ".md".
   const sanitize = (conv) => {
     const title = (conv.name || '').trim();
-    const cleaned = capNameLength((title || conv.uuid).replace(/[<>:"/\\|?*\x00-\x1f\x7f]/g, '_'));
-    // "." and ".." are path segments, not names: as a nested-export folder they
-    // produce entries like "./x" or "../x", which collide with a root entry or
-    // escape the extraction directory once an unzip tool normalizes them.
-    return /^\.+$/.test(cleaned) ? conv.uuid : cleaned;
+    const sanitized = capNameLength((title || conv.uuid).replace(/[<>:"/\\|?*\x00-\x1f\x7f]/g, '_'));
+    // Trailing dots and spaces are stripped by Windows on extraction, so
+    // "Report." and "Report" would become one file; strip them here instead, and
+    // let the dedup rename whatever now collides. Done after the cap, because
+    // truncation can leave a name ending in a dot. What remains empty was a
+    // path segment ("." or "..") or nothing at all, and falls back to the UUID.
+    const cleaned = sanitized.replace(/[. ]+$/, '');
+    return cleaned === '' ? conv.uuid : cleaned;
   };
 
   // Pass 1: every name a conversation could claim on its own merits, so a
@@ -1153,15 +1158,15 @@ function createPacer(intervalMs) {
   return { intervalMs, notBefore: 0 };
 }
 
-// fetch() that waits for the pacer, retries 429s, and returns the final
-// response (including a 429 that exhausted its attempts) for the caller to
-// check with response.ok as usual.
 function cancelledError() {
   const error = new Error('Export cancelled');
   error.exportCancelled = true;
   return error;
 }
 
+// fetch() that waits for the pacer, retries 429s, and returns the final
+// response (including a 429 that exhausted its attempts) for the caller to
+// check with response.ok as usual.
 async function fetchWithBackoff(url, options, pacer, isCancelled = () => false) {
   for (let attempt = 0; ; attempt++) {
     // Slept in slices rather than one timer: a Retry-After of 60 would
@@ -1215,14 +1220,41 @@ async function fetchWithBackoff(url, options, pacer, isCancelled = () => false) 
 // the first write and a conversation disappears from the archive with no error
 // raised anywhere. Refuse the second write instead, so a duplicate surfaces at
 // the moment it happens rather than as a short ZIP.
+// Returns a path free in this archive, suffixing before the extension if
+// needed. Flat mode joins a deduplicated conversation name and a deduplicated
+// artifact name with "_", which is also the dedup suffix character, so
+// "file_1" + "notes.md" and "file" + "1_notes.md" compose to the same path
+// even though both namespaces are internally collision-free. Renaming keeps
+// both files and records the real path in the manifest; refusing the write
+// would fail that conversation identically on every future run.
+function uniqueZipPath(zip, path) {
+  const written = zipWrittenPaths.get(zip);
+  const taken = (candidate) =>
+    (written && written.has(filenameKey(candidate))) || Boolean(zip.file(candidate));
+  if (!taken(path)) return path;
+
+  const match = path.match(/(\.[^./]+)$/);
+  const extension = match ? match[1] : '';
+  const stem = extension ? path.slice(0, -extension.length) : path;
+  let counter = 1;
+  let candidate = `${stem}_${counter}${extension}`;
+  while (taken(candidate)) {
+    counter++;
+    candidate = `${stem}_${counter}${extension}`;
+  }
+  return candidate;
+}
+
 const zipWrittenPaths = new WeakMap();
 
 function addZipFile(zip, path, content) {
   let written = zipWrittenPaths.get(zip);
   if (!written) {
     // Seeded from whatever is already in the archive, so entries written
-    // directly with zip.file are covered by the same folded comparison rather
-    // than only by the exact-match cross-check below.
+    // directly with zip.file *before* the first guarded write are covered by
+    // the same folded comparison. Raw writes made later are caught only by the
+    // exact-match cross-check below; the one such write, the manifest, is
+    // deliberately last.
     written = new Set(Object.keys(zip.files).filter(name => !zip.files[name].dir).map(filenameKey));
     zipWrittenPaths.set(zip, written);
   }
@@ -1312,6 +1344,7 @@ if (typeof module !== 'undefined' && module.exports) {
     createPacer,
     fetchWithBackoff,
     addZipFile,
+    uniqueZipPath,
     reconcileManifest,
     filenameKey,
     exportedUuids,

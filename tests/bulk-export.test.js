@@ -15,6 +15,7 @@ const {
   createPacer,
   fetchWithBackoff,
   addZipFile,
+  uniqueZipPath,
   extractArtifactFiles,
   reconcileManifest,
   exportedUuids,
@@ -148,14 +149,14 @@ describe('dedupeConversationNames', () => {
 
   it('caps a name so one long title cannot abort the whole extraction', () => {
     const names = dedupeConversationNames([conv('u1', 'x'.repeat(400))]);
-    expect([...names.get('u1')].length).toBeLessThanOrEqual(120);
+    expect([...names.get('u1')].length).toBeLessThanOrEqual(100);
   });
 
   it('does not split a surrogate pair when capping', () => {
     const names = dedupeConversationNames([conv('u1', String.fromCodePoint(0x1f600).repeat(400))]);
     const capped = names.get('u1');
     expect(capped).toBe([...capped].join(''));
-    expect([...capped].length).toBeLessThanOrEqual(120);
+    expect([...capped].length).toBeLessThanOrEqual(100);
   });
 
   it('still separates two over-long titles that share a prefix', () => {
@@ -180,10 +181,31 @@ describe('dedupeConversationNames', () => {
     expect(dedupeConversationNames([conv('u1', title)]).get('u1')).toBe('bad_title_here');
   });
 
-  it('keeps dots that are not the whole name', () => {
-    const names = dedupeConversationNames([conv('u1', 'notes.v2'), conv('u2', '._..')]);
+  it('keeps dots that are not at the end of the name', () => {
+    const names = dedupeConversationNames([conv('u1', 'notes.v2'), conv('u2', '.hidden')]);
     expect(names.get('u1')).toBe('notes.v2');
-    expect(names.get('u2')).toBe('._..');
+    expect(names.get('u2')).toBe('.hidden');
+  });
+
+  it('strips trailing dots and spaces, which Windows drops on extraction', () => {
+    const names = dedupeConversationNames([conv('u1', 'Report.'), conv('u2', 'Report')]);
+    expect(names.get('u1')).toBe('Report');
+    expect(names.get('u2')).toBe('Report_1');
+  });
+
+  it('falls back to the UUID when stripping leaves nothing', () => {
+    const names = dedupeConversationNames([conv('uuid-abc', '.. .')]);
+    expect(names.get('uuid-abc')).toBe('uuid-abc');
+  });
+
+  it('keeps a leading-dot name that still has content', () => {
+    const names = dedupeConversationNames([conv('u1', '._..')]);
+    expect(names.get('u1')).toBe('._');
+  });
+
+  it('does not leave a trailing dot behind after capping', () => {
+    const names = dedupeConversationNames([conv('u1', 'B'.repeat(99) + '. tail')]);
+    expect(names.get('u1')).not.toMatch(/[. ]$/);
   });
 
   it('strips the <>:"/\\|?* character set', () => {
@@ -711,6 +733,65 @@ describe('addZipFile', () => {
     const zip = new JSZip();
     addZipFile(zip, 'A+B (v2) [draft].md', 'one');
     expect(() => addZipFile(zip, 'AxB (v2) xdraftx.md', 'two')).not.toThrow();
+  });
+});
+
+describe('extractArtifactFiles robustness', () => {
+  it('survives an artifact whose language is not a string', () => {
+    // isProgrammingLanguage runs before getFileExtension matters, so coercing
+    // only the latter left the conversation permanently unexportable.
+    const data = {
+      name: 'Conv', uuid: 'u1', current_leaf_message_uuid: 'm2',
+      chat_messages: [
+        { uuid: 'm1', sender: 'human', parent_message_uuid: '00000000-0000-0000-0000-000000000000', content: [] },
+        { uuid: 'm2', sender: 'assistant', parent_message_uuid: 'm1', content: [{
+          type: 'tool_use', name: 'artifacts',
+          display_content: { type: 'code_block', code: 'x', language: 42, filename: 'a' },
+        }] },
+      ],
+    };
+    expect(() => extractArtifactFiles(data, 'original')).not.toThrow();
+  });
+});
+
+describe('uniqueZipPath', () => {
+  it('returns the path unchanged when it is free', () => {
+    expect(uniqueZipPath(new JSZip(), 'Artifacts/a.md')).toBe('Artifacts/a.md');
+  });
+
+  it('suffixes before the extension when the path is taken', () => {
+    const zip = new JSZip();
+    addZipFile(zip, 'Artifacts/a.md', 'x');
+    expect(uniqueZipPath(zip, 'Artifacts/a.md')).toBe('Artifacts/a_1.md');
+  });
+
+  it('keeps suffixing until it finds a free path', () => {
+    const zip = new JSZip();
+    addZipFile(zip, 'Artifacts/a.md', 'x');
+    addZipFile(zip, 'Artifacts/a_1.md', 'y');
+    expect(uniqueZipPath(zip, 'Artifacts/a.md')).toBe('Artifacts/a_2.md');
+  });
+
+  it('respects filesystem folding, not just exact matches', () => {
+    const zip = new JSZip();
+    addZipFile(zip, 'Artifacts/A.MD', 'x');
+    expect(uniqueZipPath(zip, 'Artifacts/a.md')).toBe('Artifacts/a_1.md');
+  });
+
+  it('resolves the flat-mode composite collision instead of failing it', () => {
+    // "file_1" + "notes.md" and "file" + "1_notes.md" compose identically.
+    const zip = new JSZip();
+    const first = uniqueZipPath(zip, 'Artifacts/file_1_notes.md');
+    addZipFile(zip, first, 'a');
+    const second = uniqueZipPath(zip, 'Artifacts/file_1_notes.md');
+    expect(second).not.toBe(first);
+    expect(() => addZipFile(zip, second, 'b')).not.toThrow();
+  });
+
+  it('does not treat a dot inside a folder name as an extension', () => {
+    const zip = new JSZip();
+    addZipFile(zip, 'v1.2/a', 'x');
+    expect(uniqueZipPath(zip, 'v1.2/a')).toBe('v1.2/a_1');
   });
 });
 

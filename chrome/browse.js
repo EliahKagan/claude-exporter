@@ -96,33 +96,59 @@ function getDisplayModel(conv) {
   return { model: conv.model, other: conv.model, otherLabel: '', bounced: false };
 }
 
-async function saveExportTimestamp(conversationId) {
-  exportTimestamps[conversationId] = new Date().toISOString();
+// Persists export timestamps by merging into whatever storage currently holds,
+// rather than writing this page's in-memory copy: a popup export may have
+// written its own while this page sat open. Always settles and never rejects —
+// it runs after the archive has already downloaded, so a storage failure must
+// be reported without derailing the rest of the reporting. Returns whether the
+// write actually landed.
+async function persistExportTimestamps(conversationIds) {
+  const now = new Date().toISOString();
   return new Promise((resolve) => {
-    chrome.storage.local.set({ exportTimestamps }, resolve);
+    let settled = false;
+    const done = (ok, error) => {
+      if (settled) return;
+      settled = true;
+      resolve({ ok, error });
+    };
+    try {
+      chrome.storage.local.get(['exportTimestamps'], (stored) => {
+        try {
+          if (chrome.runtime.lastError) {
+            done(false, chrome.runtime.lastError.message);
+            return;
+          }
+          // Stored first, ours second, but ours is only the ids being written
+          // now — overlaying the whole in-memory map would resurrect stale
+          // values over newer ones another context wrote.
+          const merged = Object.assign({}, (stored && stored.exportTimestamps) || {});
+          for (const id of conversationIds) {
+            merged[id] = now;
+          }
+          chrome.storage.local.set({ exportTimestamps: merged }, () => {
+            if (chrome.runtime.lastError) {
+              done(false, chrome.runtime.lastError.message);
+              return;
+            }
+            exportTimestamps = merged;
+            done(true, null);
+          });
+        } catch (error) {
+          done(false, error.message);
+        }
+      });
+    } catch (error) {
+      done(false, error.message);
+    }
   });
 }
 
+async function saveExportTimestamp(conversationId) {
+  return persistExportTimestamps([conversationId]);
+}
+
 async function saveExportTimestamps(conversationIds) {
-  const now = new Date().toISOString();
-  return new Promise((resolve, reject) => {
-    // Re-read first: this page may have been open while a popup export wrote
-    // its own timestamps, and writing our stale copy would drop them.
-    chrome.storage.local.get(['exportTimestamps'], (stored) => {
-      const merged = Object.assign({}, stored.exportTimestamps || {}, exportTimestamps);
-      for (const id of conversationIds) {
-        merged[id] = now;
-        exportTimestamps[id] = now;
-      }
-      chrome.storage.local.set({ exportTimestamps: merged }, () => {
-        if (chrome.runtime.lastError) {
-          reject(new Error(chrome.runtime.lastError.message));
-          return;
-        }
-        resolve();
-      });
-    });
-  });
+  return persistExportTimestamps(conversationIds);
 }
 
 async function loadDateTimePrefs() {
@@ -993,9 +1019,12 @@ async function exportAllFiltered() {
             writeFile(`Chats/${filename}`, content);
           }
 
-          // Add artifacts to Artifacts folder with conversation name prefix
+          // Add artifacts to Artifacts folder with conversation name prefix.
+          // Through uniqueZipPath: the "_" join is also the dedup suffix
+          // character, so two conversations with collision-free names can
+          // still compose the same path.
           for (const artifact of artifactFiles) {
-            writeFile(`Artifacts/${safeName}_${artifact.filename}`, artifact.content);
+            writeFile(uniqueZipPath(zip, `Artifacts/${safeName}_${artifact.filename}`), artifact.content);
           }
         }
         // Nested export: create per-conversation folders with artifacts subfolder
@@ -1132,9 +1161,16 @@ async function exportAllFiltered() {
     // Record export timestamps only for conversations whose files are provably
     // in the archive, so a failed or clobbered conversation stays flagged as
     // new on the next run.
-    await saveExportTimestamps(reconciledIds);
+    const saved = await saveExportTimestamps(reconciledIds);
     displayConversations();
     updateStats();
+
+    if (!saved.ok) {
+      // The archive downloaded; only the bookkeeping failed. Say so rather
+      // than letting the run look like a clean success, but keep going so the
+      // integrity check below is still reported.
+      showToast(`Export downloaded, but recording it failed: ${saved.error}. These conversations will show as new again.`, true);
+    }
 
     if (!reconciliation.ok || duplicateEntries.length > 0) {
       // Loud on purpose: either the archive does not contain what the run just
@@ -1295,7 +1331,11 @@ function setupEventListeners() {
   // Mark all as exported
   document.getElementById('markAllExported').addEventListener('click', async () => {
     const ids = allConversations.map(c => c.uuid);
-    await saveExportTimestamps(ids);
+    const saved = await saveExportTimestamps(ids);
+    if (!saved.ok) {
+      showToast(`Could not save: ${saved.error}`, true);
+      return;
+    }
     displayConversations();
     updateStats();
     settingsDropdown.classList.remove('open');

@@ -15,11 +15,17 @@ function recordExportTimestamp(conversationId) {
   chrome.storage.local.get(['exportTimestamps'], (result) => {
     const timestamps = result.exportTimestamps || {};
     timestamps[conversationId] = new Date().toISOString();
-    chrome.storage.local.set({ exportTimestamps: timestamps });
+    chrome.storage.local.set({ exportTimestamps: timestamps }, () => {
+      if (chrome.runtime.lastError) {
+        console.error('Failed to record export timestamps:', chrome.runtime.lastError.message);
+      }
+    });
   });
 }
 
 // Record export timestamps for multiple conversations
+// Mirrors browse.js: merge into what storage currently holds and report a
+// failed write, rather than dropping it silently.
 function recordExportTimestamps(conversationIds) {
   chrome.storage.local.get(['exportTimestamps'], (result) => {
     const timestamps = result.exportTimestamps || {};
@@ -27,7 +33,11 @@ function recordExportTimestamps(conversationIds) {
     for (const id of conversationIds) {
       timestamps[id] = now;
     }
-    chrome.storage.local.set({ exportTimestamps: timestamps });
+    chrome.storage.local.set({ exportTimestamps: timestamps }, () => {
+      if (chrome.runtime.lastError) {
+        console.error('Failed to record export timestamps:', chrome.runtime.lastError.message);
+      }
+    });
   });
 }
 
@@ -102,9 +112,9 @@ function getLocalDateTimeString() {
   async function fetchAllConversations(orgId) {
     const url = `https://claude.ai/api/organizations/${orgId}/chat_conversations`;
     
-    // Through the backoff helper like every other request: a single 429 here
-    // aborts the whole export before it starts, and this is also the call the
-    // browse page relays through.
+    // Through the backoff helper: a single 429 here aborts the whole export
+    // before anything is written, and this is also the call the browse page
+    // relays through.
     const response = await fetchWithBackoff(url, {
       credentials: 'include',
       headers: {
@@ -463,9 +473,12 @@ function getLocalDateTimeString() {
                   writeFile(`Chats/${conversationFilename}`, conversationContent);
                 }
 
-                // Add artifacts to Artifacts folder with conversation name prefix
+                // Add artifacts to Artifacts folder with conversation name prefix.
+                // Through uniqueZipPath: the "_" join is also the dedup suffix
+                // character, so two conversations with collision-free names can
+                // still compose the same path.
                 for (const artifact of artifactFiles) {
-                  writeFile(`Artifacts/${folderName}_${artifact.filename}`, artifact.content);
+                  writeFile(uniqueZipPath(zip, `Artifacts/${folderName}_${artifact.filename}`), artifact.content);
                 }
               }
               // Nested export: create per-conversation folders with artifacts subfolder
@@ -505,7 +518,16 @@ function getLocalDateTimeString() {
           const { count: exportedCount, problems } = await finishExport(zip, prefix);
 
           const failures = describeFailures();
-          if (problems.length > 0 || failures.length > 0) {
+          if (exportedCount === 0 && failures.length === 0 && problems.length === 0) {
+            // Nothing matched the selected options — chats disabled with no
+            // artifact extraction, say. Reporting plain success here would
+            // present an archive holding only a manifest as a completed export.
+            sendResponse({
+              success: true,
+              count: 0,
+              warnings: `Nothing was exported: none of the ${conversations.length} conversations produced a file with the options selected.`
+            });
+          } else if (problems.length > 0 || failures.length > 0) {
             console.warn('Export completed with problems:', { problems, failures });
             const detail = [];
             if (problems.length > 0) detail.push(problems.join('; '));
@@ -568,7 +590,16 @@ function getLocalDateTimeString() {
           const { count: exportedCount, problems } = await finishExport(zip, 'claude-exports');
 
           const failures = describeFailures();
-          if (problems.length > 0 || failures.length > 0) {
+          if (exportedCount === 0 && failures.length === 0 && problems.length === 0) {
+            // Nothing matched the selected options — chats disabled with no
+            // artifact extraction, say. Reporting plain success here would
+            // present an archive holding only a manifest as a completed export.
+            sendResponse({
+              success: true,
+              count: 0,
+              warnings: `Nothing was exported: none of the ${conversations.length} conversations produced a file with the options selected.`
+            });
+          } else if (problems.length > 0 || failures.length > 0) {
             console.warn('Export completed with problems:', { problems, failures });
             const detail = [];
             if (problems.length > 0) detail.push(problems.join('; '));
