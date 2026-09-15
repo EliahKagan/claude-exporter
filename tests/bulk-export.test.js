@@ -15,6 +15,7 @@ const {
   createPacer,
   fetchWithBackoff,
   addZipFile,
+  toZipBytes,
   uniqueZipPath,
   extractArtifactFiles,
   filenameKey,
@@ -937,6 +938,58 @@ describe('assertConversationShape', () => {
   it('rejects a payload the API says is truncated', () => {
     expect(() => assertConversationShape({ uuid: 'u', chat_messages: [], truncated: true }))
       .toThrow(/truncated/);
+  });
+});
+
+describe('toZipBytes', () => {
+  it('encodes a string to UTF-8 bytes', () => {
+    expect(Array.from(toZipBytes('A\u00e9'))).toEqual([0x41, 0xc3, 0xa9]);
+  });
+
+  it('passes bytes through untouched, so an already-encoded write is not re-encoded', () => {
+    const bytes = new Uint8Array([0xf0, 0x9f, 0x90, 0x8e]);
+    expect(toZipBytes(bytes)).toBe(bytes);
+  });
+
+  it('encodes an astral character as one four-byte sequence', () => {
+    expect(Array.from(toZipBytes('\u{1F40E}'))).toEqual([0xf0, 0x9f, 0x90, 0x8e]);
+  });
+});
+
+describe('addZipFile UTF-8 integrity', () => {
+  // JSZip hands string content to its utf-8 encode worker in 16384-code-unit
+  // chunks and keeps no leftover across them, so a surrogate pair split by a
+  // boundary is encoded as two lone surrogates. Writing bytes ourselves avoids
+  // that path entirely. Both boundaries are checked because the bug recurs at
+  // every multiple of the chunk size, not just the first.
+  const horse = '\u{1F40E}';
+
+  for (const boundary of [16384, 32768]) {
+    it(`round-trips an astral character straddling code unit ${boundary}`, async () => {
+      // One 'a' short of the boundary, so the high surrogate is the chunk's
+      // last code unit and its low surrogate opens the next chunk.
+      const content = 'a'.repeat(boundary - 1) + horse + 'tail';
+      const zip = new JSZip();
+      addZipFile(zip, 'a.json', content);
+      const bytes = await zip.file('a.json').async('uint8array');
+      expect(Array.from(bytes.slice(boundary - 1, boundary + 3)))
+        .toEqual([0xf0, 0x9f, 0x90, 0x8e]);
+      expect(new TextDecoder('utf-8', { fatal: true }).decode(bytes)).toBe(content);
+    });
+  }
+
+  it('leaves an astral character away from a boundary correct too', async () => {
+    const content = 'a'.repeat(100) + horse + 'tail';
+    const zip = new JSZip();
+    addZipFile(zip, 'a.json', content);
+    const bytes = await zip.file('a.json').async('uint8array');
+    expect(new TextDecoder('utf-8', { fatal: true }).decode(bytes)).toBe(content);
+  });
+
+  it('still reads back as a string, so existing consumers are unaffected', async () => {
+    const zip = new JSZip();
+    addZipFile(zip, 'a.json', 'plain');
+    expect(await zip.file('a.json').async('string')).toBe('plain');
   });
 });
 

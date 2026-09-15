@@ -217,10 +217,10 @@ function getLocalDateTimeString() {
               // Flat export: add to Chats folder
               if (request.flattenArtifacts && !request.extractArtifacts) {
                 const chatsFolder = zip.folder('Chats');
-                chatsFolder.file(conversationFilename, conversationContent);
+                chatsFolder.file(conversationFilename, toZipBytes(conversationContent));
               } else {
                 // Nested or no artifact extraction: add to root
-                zip.file(conversationFilename, conversationContent);
+                zip.file(conversationFilename, toZipBytes(conversationContent));
               }
             }
 
@@ -229,7 +229,7 @@ function getLocalDateTimeString() {
             if (request.extractArtifacts) {
               const artifactsFolder = request.includeChats !== false ? zip.folder('artifacts') : zip;
               for (const artifact of artifactFiles) {
-                artifactsFolder.file(artifact.filename, artifact.content);
+                artifactsFolder.file(artifact.filename, toZipBytes(artifact.content));
               }
             }
 
@@ -238,7 +238,7 @@ function getLocalDateTimeString() {
               const artifactsFolder = zip.folder('Artifacts');
               for (const artifact of artifactFiles) {
                 const filename = `${safeName}_${artifact.filename}`;
-                artifactsFolder.file(filename, artifact.content);
+                artifactsFolder.file(filename, toZipBytes(artifact.content));
               }
             }
 
@@ -365,7 +365,7 @@ function getLocalDateTimeString() {
           // Plain zip.file: the name is reserved in the dedup set above, so it
           // cannot collide, and throwing here would destroy the whole archive
           // at the last step.
-          zip.file(EXPORT_MANIFEST_FILENAME, JSON.stringify({
+          zip.file(EXPORT_MANIFEST_FILENAME, toZipBytes(JSON.stringify({
             generatedAt: new Date().toISOString(),
             cancelled: false,   // no cancel button on this path; kept so the schema matches
             total: manifestEntries.length,
@@ -382,7 +382,7 @@ function getLocalDateTimeString() {
             },
             reconciliation,
             conversations: manifestEntries
-          }, null, 2));
+          }, null, 2)));
 
           // Awaited: the old code started generateAsync and recorded export
           // timestamps without waiting for it, so a generation failure still

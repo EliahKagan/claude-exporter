@@ -28,6 +28,7 @@
 - Reported counts come from what actually reconciled, not from what was processed. The success toast previously counted skipped conversations, so an artifacts-only run could claim full success having recorded no exports at all.
 - `export-manifest.json` gained `unreconciled` and `pending` count buckets, and both export paths now write the same manifest schema.
 - A 429 that exhausts its retry budget still applies the server's `Retry-After` to the next request instead of discarding it.
+- File contents are encoded to UTF-8 before being handed to JSZip. JSZip feeds string content to its utf-8 encoder in 16384-code-unit chunks and, unlike its decoder, keeps no leftover state between them, so an emoji or other astral character landing exactly on a chunk boundary was split into two lone surrogates — invalid UTF-8 that makes a strict JSON parser reject the whole file. Found by diffing a real 2725-conversation export against Claude's own data export: one character, in one conversation, with nothing reported.
 
 ## [1.10.20]
 

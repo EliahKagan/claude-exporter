@@ -795,10 +795,10 @@ async function exportConversation(conversationId, conversationName) {
           // Flat export: add to Chats folder
           if (flattenArtifacts && !extractArtifacts) {
             const chatsFolder = zip.folder('Chats');
-            chatsFolder.file(conversationFilename, conversationContent);
+            chatsFolder.file(conversationFilename, toZipBytes(conversationContent));
           } else {
             // Nested or no artifact extraction: add to root
-            zip.file(conversationFilename, conversationContent);
+            zip.file(conversationFilename, toZipBytes(conversationContent));
           }
         }
 
@@ -807,7 +807,7 @@ async function exportConversation(conversationId, conversationName) {
         if (extractArtifacts) {
           const artifactsFolder = includeChats !== false ? zip.folder('artifacts') : zip;
           for (const artifact of artifactFiles) {
-            artifactsFolder.file(artifact.filename, artifact.content);
+            artifactsFolder.file(artifact.filename, toZipBytes(artifact.content));
           }
         }
 
@@ -816,7 +816,7 @@ async function exportConversation(conversationId, conversationName) {
           const artifactsFolder = zip.folder('Artifacts');
           for (const artifact of artifactFiles) {
             const filename = `${safeName}_${artifact.filename}`;
-            artifactsFolder.file(filename, artifact.content);
+            artifactsFolder.file(filename, toZipBytes(artifact.content));
           }
         }
 
@@ -1165,7 +1165,7 @@ async function exportAllFiltered() {
     // Written with a plain zip.file: the name is reserved in the dedup set
     // above, so it cannot collide, and a throw here would destroy the whole
     // archive at the last step.
-    zip.file(EXPORT_MANIFEST_FILENAME, JSON.stringify({
+    zip.file(EXPORT_MANIFEST_FILENAME, toZipBytes(JSON.stringify({
       generatedAt: new Date().toISOString(),
       cancelled: cancelledEarly,
       total,
@@ -1182,7 +1182,7 @@ async function exportAllFiltered() {
       },
       reconciliation,
       conversations: manifestEntries
-    }, null, 2));
+    }, null, 2)));
 
     // Generate and download the ZIP file
     progressText.textContent = 'Creating ZIP file...';

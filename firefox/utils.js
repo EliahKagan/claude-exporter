@@ -1336,6 +1336,20 @@ function uniqueZipPath(zip, path) {
   return candidate;
 }
 
+// JSZip 3.10.1 feeds string content through its utf-8 encode worker in chunks of
+// 16384 code units, and that worker — unlike its utf-8 decode counterpart — keeps
+// no leftover state between chunks. An astral character whose surrogate pair
+// straddles a chunk boundary is therefore encoded as two lone surrogates: CESU-8
+// in the browser, which is not valid UTF-8 and makes strict parsers reject the
+// whole entry, and two U+FFFD under Node, which loses the character outright.
+// Encoding here hands JSZip bytes it will not re-encode. Measured against a real
+// 2725-conversation export: one character, in one conversation, silently wrong.
+const ZIP_TEXT_ENCODER = new TextEncoder();
+
+function toZipBytes(content) {
+  return typeof content === 'string' ? ZIP_TEXT_ENCODER.encode(content) : content;
+}
+
 const zipWrittenPaths = new WeakMap();
 
 function addZipFile(zip, path, content) {
@@ -1362,7 +1376,7 @@ function addZipFile(zip, path, content) {
   }
 
   written.add(key);
-  zip.file(path, content);
+  zip.file(path, toZipBytes(content));
 }
 
 // Enforces "never claim success for data that is not in the archive": an entry
@@ -1457,6 +1471,7 @@ if (typeof module !== 'undefined' && module.exports) {
     createPacer,
     fetchWithBackoff,
     addZipFile,
+    toZipBytes,
     uniqueZipPath,
     reconcileManifest,
     assertConversationShape,
