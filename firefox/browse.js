@@ -681,9 +681,9 @@ function autoSelectNewUpdated() {
 
 // Export single conversation
 async function exportConversation(conversationId, conversationName) {
-  // The bulk path assigns collision-free names up front; this one builds its own
-  // ZIP, so it must at least sanitize. A raw title containing a slash used to
-  // write outside its folder and silently replace another entry.
+  // The bulk path assigns collision-free names up front; this one cannot, so it
+  // must at least sanitize. A raw title containing a slash used to write outside
+  // its folder in the ZIP branches, and silently replace another entry.
   const safeName = safeConversationName(conversationName, conversationId);
   const format = document.getElementById('exportFormat').value;
   const includeChats = document.getElementById('includeChats').checked;

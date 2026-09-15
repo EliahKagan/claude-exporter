@@ -1108,17 +1108,15 @@ const MAX_RETRY_DELAY_MS = 60000;
 const MAX_PACER_INTERVAL_MS = 5000;
 const CANCEL_POLL_MS = 250;
 
-// Assign a collision-free base filename to every conversation up front, before
-// the export loop runs, so numbering never depends on completion order.
-// Mirrors the usedFilenames dedup in extractArtifactFiles, with one change:
-// comparison is case-insensitive, because a ZIP happily holds both Recipe.md
-// and recipe.md but extracting it on Windows or macOS loses one of them.
 // The one place a conversation title becomes a filename. Exported because the
-// single-conversation export paths build their own ZIPs and must not drift
-// from the bulk ones: before this existed they used the raw title, so a title
-// containing a slash silently overwrote another entry.
+// single-conversation export paths build their own archives and must not drift
+// from the bulk one: before this existed they used the raw title, so a title
+// containing a slash silently overwrote another entry. `fallback` is the
+// conversation UUID at every call site.
 function safeConversationName(title, fallback) {
-  const trimmed = (title || '').trim();
+  // Coerced rather than trusted: a non-string title would throw out of .trim(),
+  // and at one call site that throw escapes to a try/finally with no catch.
+  const trimmed = typeof title === 'string' ? title.trim() : '';
   const sanitized = capNameLength(
     (trimmed || fallback || 'conversation')
       .replace(/[<>:"/\\|?*\x00-\x1f\x7f]/g, '_')
@@ -1127,11 +1125,17 @@ function safeConversationName(title, fallback) {
   // "Report." and "Report" would become one file; strip them here instead, and
   // let the dedup rename whatever now collides. Done after the cap, because
   // truncation can leave a name ending in a dot. What remains empty was a path
-  // segment ("." or "..") or nothing at all, and falls back to the UUID.
+  // segment ("." or "..") or nothing at all, and falls back to the caller's
+  // identifier.
   const cleaned = sanitized.replace(/[. ]+$/, '');
   return cleaned === '' ? (fallback || 'conversation') : cleaned;
 }
 
+// Assign a collision-free base filename to every conversation up front, before
+// the export loop runs, so numbering never depends on completion order.
+// Mirrors the usedFilenames dedup in extractArtifactFiles, with one change:
+// comparison folds case and Unicode normalization, because a ZIP happily holds
+// both Recipe.md and recipe.md but extracting it on Windows or macOS loses one.
 function dedupeConversationNames(conversations, reservedNames = []) {
   const sanitize = (conv) => safeConversationName(conv.name, conv.uuid);
 

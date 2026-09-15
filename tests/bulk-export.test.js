@@ -812,6 +812,14 @@ describe('safeConversationName', () => {
     expect(safeConversationName(null, 'uuid-abc')).toBe('uuid-abc');
   });
 
+  it('does not throw on a non-string title', () => {
+    // At one call site the throw would escape to a try/finally with no catch,
+    // closing the modal with no error shown.
+    expect(() => safeConversationName(42, 'uuid-abc')).not.toThrow();
+    expect(safeConversationName(42, 'uuid-abc')).toBe('uuid-abc');
+    expect(safeConversationName({}, 'uuid-abc')).toBe('uuid-abc');
+  });
+
   it('has a last-resort fallback when there is no identifier either', () => {
     expect(safeConversationName(null, null)).toBe('conversation');
   });
