@@ -817,17 +817,33 @@ describe('filenameKey', () => {
 
 describe('getCurrentBranch', () => {
   it('terminates on a cyclic parent chain', () => {
-    // Malformed, but a hang here freezes the whole export inside the loop
-    // where the cancel flag is never checked.
+    // Malformed, but a hang here freezes the whole export inside the loop where
+    // the cancel flag is never checked.
+    //
+    // The walk reads parent_message_uuid once per step, so a counting getter
+    // bounds it: without the cycle guard this throws on the 50th read instead
+    // of spinning forever. That matters — a synchronous infinite loop is not
+    // something vitest's timeout can interrupt, so the unbounded version of
+    // this test wedges the runner and pegs a core until killed by hand.
+    let reads = 0;
+    // Defined in the literal, not spread in: spreading would invoke the getter
+    // once and copy a plain value, leaving nothing to count.
+    const message = (uuid, sender, parent) => ({
+      uuid,
+      sender,
+      content: [],
+      get parent_message_uuid() {
+        if (++reads > 50) throw new Error('getCurrentBranch did not terminate');
+        return parent;
+      },
+    });
     const data = {
       current_leaf_message_uuid: 'b',
-      chat_messages: [
-        { uuid: 'a', parent_message_uuid: 'b', sender: 'human', content: [] },
-        { uuid: 'b', parent_message_uuid: 'a', sender: 'assistant', content: [] },
-      ],
+      chat_messages: [message('a', 'human', 'b'), message('b', 'assistant', 'a')],
     };
-    const branch = getCurrentBranch(data);
-    expect(branch.length).toBeLessThanOrEqual(2);
+
+    expect(() => getCurrentBranch(data)).not.toThrow();
+    expect(reads).toBeLessThanOrEqual(2);
   });
 
   it('still walks a normal chain to the root', () => {
