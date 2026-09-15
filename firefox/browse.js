@@ -705,14 +705,20 @@ async function exportConversation(conversationId, conversationName) {
   try {
     showToast(`Exporting ${conversationName}...`);
 
-    const response = await fetch(
+    // Through the backoff helper, like every other conversation fetch. Export
+    // All delegates here whenever exactly one conversation is in scope, and a
+    // 429 is likeliest right after a bulk run has widened the limiter.
+    // Zero-interval: there is no second request to pace against, and the
+    // helper floors the interval itself once a 429 forces a retry.
+    const response = await fetchWithBackoff(
       `https://claude.ai/api/organizations/${orgId}/chat_conversations/${conversationId}?tree=True&rendering_mode=messages&render_all_tools=true`,
       {
         credentials: 'include',
         headers: {
           'Accept': 'application/json',
         }
-      }
+      },
+      createPacer(0)
     );
 
     if (!response.ok) {
