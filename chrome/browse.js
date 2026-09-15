@@ -841,10 +841,13 @@ async function exportConversation(conversationId, conversationName) {
     }
 
     // Record export timestamp and refresh display
-    await saveExportTimestamp(conversationId);
-    showToast(artifactCount > 0
+    const saved = await saveExportTimestamp(conversationId);
+    const bookkeeping = saved.ok
+      ? ''
+      : ` — but recording the export failed (${saved.error}), so it will show as new again`;
+    showToast((artifactCount > 0
       ? `Exported: ${conversationName} with ${artifactCount} artifact(s)`
-      : `Exported: ${conversationName}`);
+      : `Exported: ${conversationName}`) + bookkeeping, !saved.ok);
     displayConversations();
     updateStats();
 
@@ -1177,12 +1180,6 @@ async function exportAllFiltered() {
     displayConversations();
     updateStats();
 
-    if (!saved.ok) {
-      // The archive downloaded; only the bookkeeping failed. Say so rather
-      // than letting the run look like a clean success, but keep going so the
-      // integrity check below is still reported.
-      showToast(`Export downloaded, but recording it failed: ${saved.error}. These conversations will show as new again.`, true);
-    }
 
     if (!reconciliation.ok || duplicateEntries.length > 0) {
       // Loud on purpose: either the archive does not contain what the run just
@@ -1202,16 +1199,23 @@ async function exportAllFiltered() {
       );
     }
 
+    // Folded into the completion message rather than raised separately:
+    // showToast replaces the toast element's text, so a warning emitted just
+    // before the completion toast is erased by it without ever being seen.
+    const bookkeeping = saved.ok
+      ? ''
+      : ` — but recording the export failed (${saved.error}), so they will show as new again`;
+
     if (cancelledEarly) {
-      showToast(`Export cancelled — partial ZIP with ${reconciledIds.length} of ${total} conversations downloaded.`);
+      showToast(`Export cancelled — partial ZIP with ${reconciledIds.length} of ${total} conversations downloaded.${bookkeeping}`, !saved.ok);
     } else if (reconciledIds.length < total) {
       // Reconciled count rather than `completed`, which counts skips and so can
       // read as a full success on a run that recorded no exports at all — but
       // still name the failures, or an HTTP failure looks like a skip.
       const skipped = manifestEntries.filter(entry => entry.status === 'skipped').length;
-      showToast(`Exported ${reconciledIds.length} of ${total} conversations (${failed} failed, ${skipped} skipped).`);
+      showToast(`Exported ${reconciledIds.length} of ${total} conversations (${failed} failed, ${skipped} skipped).${bookkeeping}`, !saved.ok);
     } else {
-      showToast(`Successfully exported all ${reconciledIds.length} conversations!`);
+      showToast(`Successfully exported all ${reconciledIds.length} conversations!${bookkeeping}`, !saved.ok);
     }
 
   } catch (error) {

@@ -719,6 +719,19 @@ describe('fetchWithBackoff', () => {
     expect(sentAt[1] - sentAt[0]).toBe(400);
   });
 
+  it('backs off even when the pacer started at zero', async () => {
+    // A one-shot fetch has nothing to pace against, so its pacer starts at 0 —
+    // but doubling zero is zero, so a server answering Retry-After: 0 used to
+    // get all seven attempts back-to-back with no delay at all.
+    const pacer = createPacer(0);
+    const sentAt = recordingFetch(response(429, '0'), response(429, '0'), response(200));
+
+    await run(fetchWithBackoff('u', {}, pacer));
+
+    expect(sentAt[1] - sentAt[0]).toBeGreaterThanOrEqual(1000);
+    expect(pacer.intervalMs).toBeGreaterThan(0);
+  });
+
   it('caps how far the interval can widen', async () => {
     const pacer = createPacer(200);
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response(429, '0')));

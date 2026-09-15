@@ -1136,6 +1136,11 @@ const EXPORT_MANIFEST_FILENAME = `${EXPORT_MANIFEST_BASENAME}.json`;
 const MAX_RETRY_ATTEMPTS = 6;
 const MAX_RETRY_DELAY_MS = 60000;
 const MAX_PACER_INTERVAL_MS = 5000;
+// Floor for the widened interval. A pacer may legitimately start at 0 — a
+// one-shot fetch has nothing to pace against — but doubling zero is zero, so
+// without a floor a server answering `Retry-After: 0` gets every retry
+// back-to-back with no delay at all.
+const MIN_BACKOFF_INTERVAL_MS = 1000;
 const CANCEL_POLL_MS = 250;
 
 // The one place a conversation title becomes a filename. Exported because the
@@ -1275,8 +1280,12 @@ async function fetchWithBackoff(url, options, pacer, isCancelled = () => false) 
 
     // Widen the interval permanently, not just for this retry. Dropping back to
     // the base interval as soon as one request succeeds walks straight back
-    // into the limiter on the next few conversations.
-    pacer.intervalMs = Math.min(pacer.intervalMs * 2, MAX_PACER_INTERVAL_MS);
+    // into the limiter on the next few conversations. Floored, because a pacer
+    // that started at zero would otherwise stay there.
+    // `|| MIN` rather than Math.max: doubling is the rule, and the floor only
+    // has to rescue the one case where doubling achieves nothing. Using a max
+    // here would also yank a 200ms base straight to the floor on its first 429.
+    pacer.intervalMs = Math.min(pacer.intervalMs * 2 || MIN_BACKOFF_INTERVAL_MS, MAX_PACER_INTERVAL_MS);
     // Never shorter than the interval just widened above: a `Retry-After: 0`
     // would otherwise send the retry immediately and undo the slowdown.
     pacer.notBefore = Date.now() + Math.max(delay, pacer.intervalMs);
