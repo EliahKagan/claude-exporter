@@ -180,6 +180,9 @@ function getLocalDateTimeString() {
           throw new Error('Invalid conversation data structure. Please refresh the page and try again.');
         }
 
+        // Same sanitizing the bulk path applies; this export builds its own ZIP.
+        const safeName = safeConversationName(data.name, request.conversationId);
+
         // Infer model if null
         data.model = inferModel(data);
         
@@ -198,15 +201,15 @@ function getLocalDateTimeString() {
               switch (request.format) {
                 case 'markdown':
                   conversationContent = convertToMarkdown(data, request.includeMetadata, request.conversationId, request.includeArtifacts, request.includeThinking);
-                  conversationFilename = `${data.name || request.conversationId}.md`;
+                  conversationFilename = `${safeName}.md`;
                   break;
                 case 'text':
                   conversationContent = convertToText(data, request.includeMetadata, request.includeArtifacts, request.includeThinking);
-                  conversationFilename = `${data.name || request.conversationId}.txt`;
+                  conversationFilename = `${safeName}.txt`;
                   break;
                 default:
                   conversationContent = JSON.stringify(data, null, 2);
-                  conversationFilename = `${data.name || request.conversationId}.json`;
+                  conversationFilename = `${safeName}.json`;
               }
 
               // Flat export: add to Chats folder
@@ -232,7 +235,7 @@ function getLocalDateTimeString() {
             if (request.flattenArtifacts && !request.extractArtifacts) {
               const artifactsFolder = zip.folder('Artifacts');
               for (const artifact of artifactFiles) {
-                const filename = `${data.name || request.conversationId}_${artifact.filename}`;
+                const filename = `${safeName}_${artifact.filename}`;
                 artifactsFolder.file(filename, artifact.content);
               }
             }
@@ -244,7 +247,7 @@ function getLocalDateTimeString() {
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
-            a.download = `${data.name || request.conversationId}.zip`;
+            a.download = `${safeName}.zip`;
             document.body.appendChild(a);
             a.click();
             document.body.removeChild(a);
@@ -259,17 +262,17 @@ function getLocalDateTimeString() {
             switch (request.format) {
               case 'markdown':
                 content = convertToMarkdown(data, request.includeMetadata, request.conversationId, request.includeArtifacts, request.includeThinking);
-                filename = `${data.name || request.conversationId}.md`;
+                filename = `${safeName}.md`;
                 type = 'text/markdown';
                 break;
               case 'text':
                 content = convertToText(data, request.includeMetadata, request.includeArtifacts, request.includeThinking);
-                filename = `${data.name || request.conversationId}.txt`;
+                filename = `${safeName}.txt`;
                 type = 'text/plain';
                 break;
               default:
                 content = JSON.stringify(data, null, 2);
-                filename = `${data.name || request.conversationId}.json`;
+                filename = `${safeName}.json`;
                 type = 'application/json';
             }
             console.log('No artifacts found. Downloading file:', filename);
@@ -291,17 +294,17 @@ function getLocalDateTimeString() {
             switch (request.format) {
               case 'markdown':
                 content = convertToMarkdown(data, request.includeMetadata, request.conversationId, request.includeArtifacts, request.includeThinking);
-                filename = `${data.name || request.conversationId}.md`;
+                filename = `${safeName}.md`;
                 type = 'text/markdown';
                 break;
               case 'text':
                 content = convertToText(data, request.includeMetadata, request.includeArtifacts, request.includeThinking);
-                filename = `${data.name || request.conversationId}.txt`;
+                filename = `${safeName}.txt`;
                 type = 'text/plain';
                 break;
               default:
                 content = JSON.stringify(data, null, 2);
-                filename = `${data.name || request.conversationId}.json`;
+                filename = `${safeName}.json`;
                 type = 'application/json';
             }
 

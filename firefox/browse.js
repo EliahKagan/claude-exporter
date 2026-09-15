@@ -681,6 +681,10 @@ function autoSelectNewUpdated() {
 
 // Export single conversation
 async function exportConversation(conversationId, conversationName) {
+  // The bulk path assigns collision-free names up front; this one builds its own
+  // ZIP, so it must at least sanitize. A raw title containing a slash used to
+  // write outside its folder and silently replace another entry.
+  const safeName = safeConversationName(conversationName, conversationId);
   const format = document.getElementById('exportFormat').value;
   const includeChats = document.getElementById('includeChats').checked;
   const includeThinking = document.getElementById('includeThinking').checked;
@@ -730,15 +734,15 @@ async function exportConversation(conversationId, conversationName) {
           switch (format) {
             case 'markdown':
               conversationContent = convertToMarkdown(data, includeMetadata, conversationId, includeArtifacts, includeThinking);
-              conversationFilename = `${conversationName || conversationId}.md`;
+              conversationFilename = `${safeName}.md`;
               break;
             case 'text':
               conversationContent = convertToText(data, includeMetadata, includeArtifacts, includeThinking);
-              conversationFilename = `${conversationName || conversationId}.txt`;
+              conversationFilename = `${safeName}.txt`;
               break;
             default:
               conversationContent = JSON.stringify(data, null, 2);
-              conversationFilename = `${conversationName || conversationId}.json`;
+              conversationFilename = `${safeName}.json`;
           }
 
           // Flat export: add to Chats folder
@@ -764,7 +768,7 @@ async function exportConversation(conversationId, conversationName) {
         if (flattenArtifacts && !extractArtifacts) {
           const artifactsFolder = zip.folder('Artifacts');
           for (const artifact of artifactFiles) {
-            const filename = `${conversationName}_${artifact.filename}`;
+            const filename = `${safeName}_${artifact.filename}`;
             artifactsFolder.file(filename, artifact.content);
           }
         }
@@ -774,7 +778,7 @@ async function exportConversation(conversationId, conversationName) {
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = `${conversationName || conversationId}.zip`;
+        a.download = `${safeName}.zip`;
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
@@ -787,17 +791,17 @@ async function exportConversation(conversationId, conversationName) {
         switch (format) {
           case 'markdown':
             content = convertToMarkdown(data, includeMetadata, conversationId, includeArtifacts, includeThinking);
-            filename = `${conversationName || conversationId}.md`;
+            filename = `${safeName}.md`;
             type = 'text/markdown';
             break;
           case 'text':
             content = convertToText(data, includeMetadata, includeArtifacts, includeThinking);
-            filename = `${conversationName || conversationId}.txt`;
+            filename = `${safeName}.txt`;
             type = 'text/plain';
             break;
           default:
             content = JSON.stringify(data, null, 2);
-            filename = `${conversationName || conversationId}.json`;
+            filename = `${safeName}.json`;
             type = 'application/json';
         }
         downloadFile(content, filename, type);
@@ -813,17 +817,17 @@ async function exportConversation(conversationId, conversationName) {
         switch (format) {
           case 'markdown':
             content = convertToMarkdown(data, includeMetadata, conversationId, includeArtifacts, includeThinking);
-            filename = `${conversationName || conversationId}.md`;
+            filename = `${safeName}.md`;
             type = 'text/markdown';
             break;
           case 'text':
             content = convertToText(data, includeMetadata, includeArtifacts, includeThinking);
-            filename = `${conversationName || conversationId}.txt`;
+            filename = `${safeName}.txt`;
             type = 'text/plain';
             break;
           default:
             content = JSON.stringify(data, null, 2);
-            filename = `${conversationName || conversationId}.json`;
+            filename = `${safeName}.json`;
             type = 'application/json';
         }
         downloadFile(content, filename, type);

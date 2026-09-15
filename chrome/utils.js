@@ -579,17 +579,32 @@ function filenameKey(name) {
   return name.normalize('NFC').toUpperCase();
 }
 
-// Per-component cap. APFS and NTFS reject components over 255 UTF-16 units and
-// ditto aborts the entire extraction on the first one, so an over-long name
-// takes unrelated conversations down with it. Flat mode joins two capped names
-// with an underscore, and suffixes and an extension are appended after the cap,
-// so the bound that matters is 2N + (dedup suffix) + (artifact suffix) +
-// (separator) + (extension) <= 255. At N = 100 that is about 220.
-const MAX_NAME_CHARS = 100;
+// Characters that are legal in a JS string and in a ZIP entry name but not in
+// a filename. Unassigned code points and noncharacters (both General_Category
+// Cn) are rejected outright by APFS, and an unpaired surrogate is worse: JSZip
+// encodes entry names as UTF-8 and maps every surrogate to U+FFFD, so two
+// conversations whose titles differ only in an unpaired surrogate become one
+// byte-identical archive entry — invisible to every check we make, because the
+// in-memory JS strings really are distinct.
+const UNSAFE_CODE_POINTS = /[\p{Cn}\p{Cs}]/gu;
+
+// Per-component cap, in UTF-16 code units because that is what APFS and NTFS
+// count — an astral character costs two. ditto skips an over-long entry and
+// continues, so one long name loses its own file rather than the archive's,
+// but it loses it silently. Flat mode joins two capped names with an
+// underscore and appends suffixes and an extension afterwards, so the bound
+// that matters is 2N + suffixes + separator + extension <= 255; N = 100 leaves
+// room.
+const MAX_NAME_UNITS = 100;
 
 function capNameLength(name) {
-  const chars = [...name];   // by code point, so a surrogate pair is never split
-  return chars.length <= MAX_NAME_CHARS ? name : chars.slice(0, MAX_NAME_CHARS).join('');
+  if (name.length <= MAX_NAME_UNITS) return name;
+  let capped = '';
+  for (const character of name) {          // iterates by code point
+    if (capped.length + character.length > MAX_NAME_UNITS) break;
+    capped += character;
+  }
+  return capped;
 }
 
 // Extract all artifacts from a conversation into separate files
@@ -607,7 +622,8 @@ function extractArtifactFiles(data, artifactFormat = 'original') {
       // Generate filename from title and language
       let baseFilename = artifact.title || 'artifact';
       // Sanitize filename (remove invalid characters)
-      baseFilename = capNameLength(baseFilename.replace(/[<>:"/\\|?*\x00-\x1f\x7f]/g, '_'));
+      baseFilename = capNameLength(
+        baseFilename.replace(/[<>:"/\\|?*\x00-\x1f\x7f]/g, '_').replace(UNSAFE_CODE_POINTS, '_'));
 
       // Convert artifact based on selected format
       const converted = convertArtifactFormat(
@@ -1087,20 +1103,27 @@ const CANCEL_POLL_MS = 250;
 // Mirrors the usedFilenames dedup in extractArtifactFiles, with one change:
 // comparison is case-insensitive, because a ZIP happily holds both Recipe.md
 // and recipe.md but extracting it on Windows or macOS loses one of them.
+// The one place a conversation title becomes a filename. Exported because the
+// single-conversation export paths build their own ZIPs and must not drift
+// from the bulk ones: before this existed they used the raw title, so a title
+// containing a slash silently overwrote another entry.
+function safeConversationName(title, fallback) {
+  const trimmed = (title || '').trim();
+  const sanitized = capNameLength(
+    (trimmed || fallback || 'conversation')
+      .replace(/[<>:"/\\|?*\x00-\x1f\x7f]/g, '_')
+      .replace(UNSAFE_CODE_POINTS, '_'));
+  // Trailing dots and spaces are stripped by Windows on extraction, so
+  // "Report." and "Report" would become one file; strip them here instead, and
+  // let the dedup rename whatever now collides. Done after the cap, because
+  // truncation can leave a name ending in a dot. What remains empty was a path
+  // segment ("." or "..") or nothing at all, and falls back to the UUID.
+  const cleaned = sanitized.replace(/[. ]+$/, '');
+  return cleaned === '' ? (fallback || 'conversation') : cleaned;
+}
+
 function dedupeConversationNames(conversations, reservedNames = []) {
-  // Null, empty and whitespace-only titles fall back to the UUID rather than
-  // producing a file called ".md".
-  const sanitize = (conv) => {
-    const title = (conv.name || '').trim();
-    const sanitized = capNameLength((title || conv.uuid).replace(/[<>:"/\\|?*\x00-\x1f\x7f]/g, '_'));
-    // Trailing dots and spaces are stripped by Windows on extraction, so
-    // "Report." and "Report" would become one file; strip them here instead, and
-    // let the dedup rename whatever now collides. Done after the cap, because
-    // truncation can leave a name ending in a dot. What remains empty was a
-    // path segment ("." or "..") or nothing at all, and falls back to the UUID.
-    const cleaned = sanitized.replace(/[. ]+$/, '');
-    return cleaned === '' ? conv.uuid : cleaned;
-  };
+  const sanitize = (conv) => safeConversationName(conv.name, conv.uuid);
 
   // Pass 1: every name a conversation could claim on its own merits, so a
   // deduplicated "doc" skips past a conversation genuinely titled "doc_1"
@@ -1368,6 +1391,7 @@ if (typeof module !== 'undefined' && module.exports) {
     addZipFile,
     uniqueZipPath,
     reconcileManifest,
+    safeConversationName,
     filenameKey,
     exportedUuids,
   };

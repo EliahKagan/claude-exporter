@@ -18,6 +18,7 @@ const {
   uniqueZipPath,
   extractArtifactFiles,
   filenameKey,
+  safeConversationName,
   getFileExtension,
   isProgrammingLanguage,
   reconcileManifest,
@@ -164,7 +165,22 @@ describe('dedupeConversationNames', () => {
     const capped = names.get('u1');
     const loneSurrogate = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
     expect(loneSurrogate.test(capped)).toBe(false);
-    expect([...capped].length).toBe(100);
+    expect(capped.length).toBeLessThanOrEqual(100);
+  });
+
+  it('caps by UTF-16 units, which is what the filesystem counts', () => {
+    // An astral character costs two units. Counting code points let a
+    // flat-mode path reach 440 units against a 255-unit limit.
+    const capped = dedupeConversationNames([conv('u1', String.fromCodePoint(0x1f600).repeat(200))]).get('u1');
+    expect(capped.length).toBeLessThanOrEqual(100);
+    expect([...capped].length).toBe(50);
+  });
+
+  it('keeps a flat-mode composite inside the filesystem limit', () => {
+    const astral = String.fromCodePoint(0x1f600).repeat(200);
+    const name = dedupeConversationNames([conv('u1', astral)]).get('u1');
+    const artifact = `${'x'.repeat(100)}.dockerfile`;
+    expect(`Artifacts/${name}_2725_${artifact}`.length).toBeLessThan(255);
   });
 
   it('caps to exactly the limit, pinning the lower bound too', () => {
@@ -175,6 +191,46 @@ describe('dedupeConversationNames', () => {
   it('leaves a name of exactly the limit untouched', () => {
     const exact = 'y'.repeat(100);
     expect(dedupeConversationNames([conv('u1', exact)]).get('u1')).toBe(exact);
+  });
+
+  it('replaces unassigned code points and noncharacters', () => {
+    // APFS rejects these outright, so the entry sits in the archive but no file
+    // is ever written and nothing downstream notices.
+    for (const codePoint of [0x378, 0xfdd0, 0xfffe]) {
+      const title = 'Plan ' + String.fromCodePoint(codePoint) + ' review';
+      expect(dedupeConversationNames([conv('u1', title)]).get('u1')).toBe('Plan _ review');
+    }
+  });
+
+  it('separates titles differing only in an unpaired surrogate', async () => {
+    // JSZip encodes entry names as UTF-8 and maps every surrogate to U+FFFD,
+    // so these produced byte-identical archive entries while remaining
+    // distinct JS strings — invisible to the dedup, the guard and
+    // reconciliation alike.
+    const titles = [0xd83d, 0xd83c, 0xdc00].map(c => 'Report ' + String.fromCharCode(c) + ' end');
+    const names = dedupeConversationNames(titles.map((name, i) => conv(`u${i}`, name)));
+    const zip = new JSZip();
+    for (const name of names.values()) addZipFile(zip, `${name}.md`, 'x');
+
+    // Generated and reloaded on purpose: the collapse happens when JSZip
+    // encodes names as UTF-8, not when it stores the JS-string key, so counting
+    // zip.files would check the wrong thing.
+    const reloaded = await JSZip.loadAsync(await zip.generateAsync({ type: 'nodebuffer' }));
+    expect(Object.keys(reloaded.files)).toHaveLength(3);
+  });
+
+  it('keeps artifact filenames free of unsafe code points too', () => {
+    const names = namesForArtifacts('we' + String.fromCharCode(0xd83d) + 'ird.py',
+                                    'we' + String.fromCharCode(0xdc00) + 'ird.py');
+    expect(new Set(names).size).toBe(2);
+    for (const name of names) {
+      expect(/[\p{Cn}\p{Cs}]/u.test(name)).toBe(false);
+    }
+  });
+
+  it('keeps valid astral characters', () => {
+    const emoji = String.fromCodePoint(0x1f600);
+    expect(dedupeConversationNames([conv('u1', `a${emoji}b`)]).get('u1')).toBe(`a${emoji}b`);
   });
 
   it('strips DEL as well as the C0 controls', () => {
@@ -709,6 +765,35 @@ describe('filenameKey', () => {
   });
 });
 
+describe('safeConversationName', () => {
+  // The single-conversation export paths build their own ZIPs and used the raw
+  // title, so a slash wrote outside the intended folder and silently replaced
+  // another entry. They share this with the bulk dedup now.
+  it('replaces path separators', () => {
+    expect(safeConversationName('artifacts/Q3 plan', 'uuid')).toBe('artifacts_Q3 plan');
+  });
+
+  it('caps an over-long title', () => {
+    expect(safeConversationName('A'.repeat(300), 'uuid').length).toBe(100);
+  });
+
+  it('falls back when nothing survives sanitizing', () => {
+    expect(safeConversationName('..', 'uuid-abc')).toBe('uuid-abc');
+    expect(safeConversationName('', 'uuid-abc')).toBe('uuid-abc');
+    expect(safeConversationName(null, 'uuid-abc')).toBe('uuid-abc');
+  });
+
+  it('has a last-resort fallback when there is no identifier either', () => {
+    expect(safeConversationName(null, null)).toBe('conversation');
+  });
+
+  it('agrees with the bulk dedup for a conversation with no duplicates', () => {
+    const title = 'Plan/2025: "final"';
+    expect(dedupeConversationNames([conv('u1', title)]).get('u1'))
+      .toBe(safeConversationName(title, 'u1'));
+  });
+});
+
 describe('createPacer', () => {
   it('starts with no deadline, so the first request is not delayed', () => {
     expect(createPacer(200)).toEqual({ intervalMs: 200, notBefore: 0 });
@@ -818,6 +903,19 @@ describe('addZipFile', () => {
     expect(() => addZipFile(zip, 'AxB (v2) xdraftx.md', 'two')).not.toThrow();
   });
 });
+
+// Artifact filenames go through a second, separate sanitizer; several tests
+// need to reach it from outside the artifact describe block.
+const namesForArtifacts = (...filenames) => extractArtifactFiles({
+  name: 'Conv', uuid: 'u1', current_leaf_message_uuid: 'm2',
+  chat_messages: [
+    { uuid: 'm1', sender: 'human', parent_message_uuid: '00000000-0000-0000-0000-000000000000', content: [] },
+    { uuid: 'm2', sender: 'assistant', parent_message_uuid: 'm1', content: filenames.map(filename => ({
+      type: 'tool_use', name: 'artifacts',
+      display_content: { type: 'code_block', code: 'print(1)', language: 'python', filename },
+    })) },
+  ],
+}, 'original').map(a => a.filename);
 
 describe('extractArtifactFiles robustness', () => {
   it('survives an artifact whose language is not a string', () => {
