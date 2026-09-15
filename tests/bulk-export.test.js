@@ -18,6 +18,7 @@ const {
   toZipBytes,
   collectArtifactMeta,
   artifactFromToolInput,
+  convertToMarkdown,
   uniqueZipPath,
   extractArtifactFiles,
   filenameKey,
@@ -943,6 +944,141 @@ describe('assertConversationShape', () => {
   });
 });
 
+describe('artifact metadata precedence', () => {
+  const call = (input, name = 'artifacts') => ({ type: 'tool_use', name, input });
+  const fromBlocks = (blocks) => extractArtifactFiles({
+    name: 'Conv', uuid: 'u1', current_leaf_message_uuid: 'm2',
+    chat_messages: [
+      { uuid: 'm1', sender: 'human', parent_message_uuid: '00000000-0000-0000-0000-000000000000', content: [] },
+      { uuid: 'm2', sender: 'assistant', parent_message_uuid: 'm1', content: blocks },
+    ],
+  }, 'original');
+
+  it('lets the FIRST declaration win when a later call declares a different title', () => {
+    // The fixture that only omits the title cannot distinguish first-wins from
+    // last-wins; this one does. Last-wins would name the rewrite Second_1.html,
+    // and preferring the remembered title over the call's own would name the
+    // second create First_1.md.
+    const files = fromBlocks([
+      call({ command: 'create', id: 'a1', title: 'First', type: 'text/markdown', content: 'v1' }),
+      call({ command: 'create', id: 'a1', title: 'Second', type: 'text/html', content: 'v2' }),
+      call({ command: 'rewrite', id: 'a1', content: 'v3' }),
+    ]);
+    expect(files.map(f => f.filename)).toEqual(['First.md', 'Second.html', 'First_1.md']);
+  });
+
+  it('carries metadata across a create_file chain, not only an artifacts one', () => {
+    const files = fromBlocks([
+      call({ command: 'create', id: 'a1', title: 'CF', type: 'text/markdown', content: 'v1' }, 'create_file'),
+      call({ command: 'rewrite', id: 'a1', content: 'v2' }, 'create_file'),
+    ]);
+    expect(files.map(f => f.filename)).toEqual(['CF.md', 'CF_1.md']);
+  });
+
+  it('takes the language from an earlier call for a code artifact, whose type implies none', () => {
+    // ARTIFACT_TYPE_LANGUAGES['application/vnd.ant.code'] is deliberately '' so
+    // the chain falls through to the remembered language. Anything truthy there
+    // would break this.
+    const meta = collectArtifactMeta([{ content: [
+      call({ command: 'create', id: 'a1', title: 'S', type: 'application/vnd.ant.code', language: 'rust' }),
+    ] }]);
+    expect(artifactFromToolInput({ command: 'rewrite', id: 'a1', content: 'x' }, meta).language).toBe('rust');
+  });
+
+  it('falls back to txt for a code artifact when nothing ever declared a language', () => {
+    const a = artifactFromToolInput({
+      command: 'create', id: 'a1', type: 'application/vnd.ant.code', content: 'x',
+    }, new Map());
+    expect(a.language).toBe('txt');
+  });
+
+  it('prefers the language its own type implies over a remembered one', () => {
+    const meta = collectArtifactMeta([{ content: [
+      call({ command: 'create', id: 'a1', title: 'S', type: 'application/vnd.ant.code', language: 'python' }),
+    ] }]);
+    const a = artifactFromToolInput({ command: 'rewrite', id: 'a1', type: 'text/markdown', content: 'x' }, meta);
+    expect(a.language).toBe('markdown');
+  });
+});
+
+describe('artifact extraction hostile inputs', () => {
+  const call = (input) => ({ type: 'tool_use', name: 'artifacts', input });
+  const conv = (blocks) => ({
+    name: 'Conv', uuid: 'u1', current_leaf_message_uuid: 'm2',
+    chat_messages: [
+      { uuid: 'm1', sender: 'human', parent_message_uuid: '00000000-0000-0000-0000-000000000000', content: [] },
+      { uuid: 'm2', sender: 'assistant', parent_message_uuid: 'm1', content: blocks },
+    ],
+  });
+
+  it('survives a non-string title instead of failing the whole conversation', () => {
+    // The title reaches baseFilename.replace(...). A throw here is caught by the
+    // export loop and marks the conversation failed, losing its chat file too —
+    // the same failure a non-string language once caused.
+    for (const title of [42, {}, ['x'], true]) {
+      const data = conv([call({ command: 'create', id: 'a', title, type: 'text/markdown', content: 'body' })]);
+      expect(() => extractArtifactFiles(data, 'original')).not.toThrow();
+      expect(extractArtifactFiles(data, 'original')[0].content).toBe('body');
+    }
+  });
+
+  it('ignores a non-string language and type rather than naming a file after them', () => {
+    const a = artifactFromToolInput({ command: 'create', id: 'a', language: 42, type: {}, content: 'x' });
+    expect(a.language).toBe('txt');
+  });
+
+  it('writes no file for a whitespace-only body', () => {
+    // An empty file still counts as a written file, which would mark the
+    // conversation exported and earn it an export timestamp.
+    expect(fromWhitespace('   \n\t ')).toEqual([]);
+    expect(fromWhitespace('')).toEqual([]);
+    function fromWhitespace(content) {
+      return extractArtifactFiles(conv([call({ command: 'create', id: 'a', title: 'T', type: 'text/markdown', content })]), 'original');
+    }
+  });
+
+  it('does not resolve a type that collides with Object.prototype', () => {
+    // A plain object literal would return a function here, which is truthy and
+    // short-circuits the rest of the language chain.
+    for (const type of ['toString', 'constructor', 'valueOf', '__proto__', 'hasOwnProperty']) {
+      expect(artifactFromToolInput({ command: 'create', id: 'a', title: 'T', type, content: 'x' }).language)
+        .toBe('txt');
+    }
+  });
+
+  it('tolerates a message whose content is present but not an array', () => {
+    // extractArtifactsFromMessage has always guarded this; collectArtifactMeta
+    // must too, or a shape that used to be ignored starts throwing.
+    for (const content of [{ type: 'text' }, 42, true, 'text']) {
+      expect(() => collectArtifactMeta([{ content }])).not.toThrow();
+    }
+  });
+});
+
+describe('chat body and artifacts folder agree', () => {
+  it('renders a rewritten artifact with the same name and language it is filed under', () => {
+    // These two paths derive artifacts separately; without the shared metadata the
+    // chat body called it Untitled/txt and emitted the body unfenced, while the
+    // artifacts folder filed it as Solver_1.py.
+    const call = (input) => ({ type: 'tool_use', name: 'artifacts', input });
+    const data = {
+      name: 'Conv', uuid: 'u1', current_leaf_message_uuid: 'm2',
+      chat_messages: [
+        { uuid: 'm1', sender: 'human', parent_message_uuid: '00000000-0000-0000-0000-000000000000', content: [] },
+        { uuid: 'm2', sender: 'assistant', parent_message_uuid: 'm1', content: [
+          call({ command: 'create', id: 'art-1', title: 'Solver', type: 'application/vnd.ant.code', language: 'python', content: 'print(1)' }),
+          call({ command: 'rewrite', id: 'art-1', content: 'print(2)' }),
+        ] },
+      ],
+    };
+    expect(extractArtifactFiles(data, 'original').map(f => f.filename)).toEqual(['Solver.py', 'Solver_1.py']);
+    const markdown = convertToMarkdown(data, false, null, true, true);
+    expect(markdown).not.toContain('Artifact: Untitled');
+    expect(markdown).toContain('**Type:** code | **Language:** python');
+    expect(markdown).toContain('```python\nprint(2)\n```');
+  });
+});
+
 describe('toZipBytes', () => {
   it('encodes a string to UTF-8 bytes', () => {
     expect(Array.from(toZipBytes('A\u00e9'))).toEqual([0x41, 0xc3, 0xa9]);
@@ -955,6 +1091,18 @@ describe('toZipBytes', () => {
 
   it('encodes an astral character as one four-byte sequence', () => {
     expect(Array.from(toZipBytes('\u{1F40E}'))).toEqual([0xf0, 0x9f, 0x90, 0x8e]);
+  });
+
+  it('refuses content JSZip would write as a silent zero-byte entry', () => {
+    // JSZip accepts null and undefined and writes an empty entry; the manifest
+    // reconciliation checks only that the entry exists, never its size, so that
+    // empty file would reconcile as a success and be timestamped.
+    expect(() => toZipBytes(null)).toThrow(/Refusing to write/);
+    expect(() => toZipBytes(undefined)).toThrow(/Refusing to write/);
+  });
+
+  it('still encodes the empty string, which is a legitimate write', () => {
+    expect(Array.from(toZipBytes(''))).toEqual([]);
   });
 });
 
@@ -1236,7 +1384,13 @@ describe('artifactFromToolInput', () => {
   });
 
   it('names an artifact Untitled only when no call ever declared a title', () => {
-    expect(artifactFromToolInput({ command: 'rewrite', id: 'a', content: 'x' }).title).toBe('Untitled');
+    // Passing a populated map matters: with no map at all the "only when" clause
+    // is vacuous, because `known` is empty for any input.
+    const meta = collectArtifactMeta([{ content: [
+      { type: 'tool_use', name: 'artifacts', input: { command: 'create', id: 'other', title: 'Elsewhere' } },
+    ] }]);
+    expect(artifactFromToolInput({ command: 'rewrite', id: 'a', content: 'x' }, meta).title).toBe('Untitled');
+    expect(artifactFromToolInput({ command: 'rewrite', id: 'other', content: 'x' }, meta).title).toBe('Elsewhere');
   });
 
   it('prefers the call\'s own language over the one its type implies', () => {
@@ -1271,7 +1425,7 @@ describe('collectArtifactMeta', () => {
       msg([call({ command: 'create', id: 'a1', title: 'One' })]),
       msg([call({ command: 'create', id: 'a2', content: 'x' })]),
     ]);
-    expect(meta.get('a2')).toEqual({});
+    expect(meta.get('a2')).toStrictEqual({});
   });
 
   it('ignores tool calls that are not artifact producers', () => {

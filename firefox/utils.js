@@ -61,6 +61,9 @@ function convertToMarkdown(data, includeMetadata, conversationId = null, include
 
   // Get only the current branch messages
   const branchMessages = getCurrentBranch(data);
+  // Shared with the artifact-file extractor so a rewritten artifact is named and
+  // fenced the same way in the chat body as in the artifacts folder.
+  const artifactMeta = collectArtifactMeta(branchMessages);
 
   for (const message of branchMessages) {
     const sender = message.sender === 'human' ? '## User' : '## Claude';
@@ -72,7 +75,7 @@ function convertToMarkdown(data, includeMetadata, conversationId = null, include
     markdown += `\n`;
 
     // Extract artifacts from the entire message (handles both old and new formats)
-    const messageArtifacts = includeArtifacts ? extractArtifactsFromMessage(message) : [];
+    const messageArtifacts = includeArtifacts ? extractArtifactsFromMessage(message, artifactMeta) : [];
     if (messageArtifacts.length > 0) {
       console.log('📦 Found', messageArtifacts.length, 'artifact(s) in message:', messageArtifacts.map(a => a.title));
     }
@@ -161,10 +164,11 @@ function convertToText(data, includeMetadata, includeArtifacts = true, includeTh
 
   // Get only the current branch messages
   const branchMessages = getCurrentBranch(data);
+  const artifactMeta = collectArtifactMeta(branchMessages);
 
   branchMessages.forEach((message) => {
     // Extract artifacts from the entire message (handles both old and new formats)
-    const artifacts = includeArtifacts ? extractArtifactsFromMessage(message) : [];
+    const artifacts = includeArtifacts ? extractArtifactsFromMessage(message, artifactMeta) : [];
 
     // Get the message text (excluding artifacts)
     let messageText = '';
@@ -256,6 +260,10 @@ function downloadFile(content, filename, type = 'application/json') {
 // implies one, and the filename and format conversion downstream want the
 // language, not the type.
 const ARTIFACT_TYPE_LANGUAGES = {
+  // Null-prototyped so an unexpected `type` cannot reach Object.prototype: a
+  // call declaring type 'toString' would otherwise resolve to a function, which
+  // is truthy and short-circuits the rest of the language chain.
+  __proto__: null,
   'text/markdown': 'markdown',
   'text/html': 'html',
   'image/svg+xml': 'svg',
@@ -271,7 +279,9 @@ function collectArtifactMeta(messages) {
   const meta = new Map();
 
   for (const message of messages) {
-    for (const content of (message.content || [])) {
+    // Guarded the way extractArtifactsFromMessage guards it: a `content` that is
+    // present but not an array used to be ignored, and must not start throwing.
+    for (const content of (Array.isArray(message.content) ? message.content : [])) {
       if (content.type !== 'tool_use') continue;
       if (content.name !== 'artifacts' && content.name !== 'create_file') continue;
 
@@ -280,9 +290,11 @@ function collectArtifactMeta(messages) {
 
       const known = meta.get(input.id) || {};
       // First declaration wins: a later call that omits a field must not erase it.
-      if (!known.title && input.title) known.title = input.title;
-      if (!known.type && input.type) known.type = input.type;
-      if (!known.language && input.language) known.language = input.language;
+      // Only strings are kept — these land in a filename, and a non-string would
+      // throw out of the sanitizer and fail the whole conversation on every run.
+      if (!known.title && typeof input.title === 'string' && input.title) known.title = input.title;
+      if (!known.type && typeof input.type === 'string' && input.type) known.type = input.type;
+      if (!known.language && typeof input.language === 'string' && input.language) known.language = input.language;
       meta.set(input.id, known);
     }
   }
@@ -290,26 +302,41 @@ function collectArtifactMeta(messages) {
   return meta;
 }
 
+function languageForArtifactType(type) {
+  return typeof type === 'string' && ARTIFACT_TYPE_LANGUAGES[type] || '';
+}
+
 // Builds an artifact from the tool call's own arguments. `update` calls are
 // deliberately not handled: they carry an old_str/new_str patch rather than a
 // body, and every artifact whose only calls are patches has no rendered base to
 // apply them to, so there is nothing to reconstruct.
 function artifactFromToolInput(input, artifactMeta) {
-  if (!input || typeof input.content !== 'string' || input.content === '') return null;
+  if (!input || typeof input.content !== 'string') return null;
+
+  // Trimmed before the emptiness test, not after: a whitespace-only body would
+  // otherwise pass the check and be written as a zero-byte file, which counts as
+  // a written file and so marks the conversation exported and timestamps it.
+  const content = input.content.trim();
+  if (content === '') return null;
 
   const known = (artifactMeta && input.id && artifactMeta.get(input.id)) || {};
-  const language = input.language
-    || ARTIFACT_TYPE_LANGUAGES[input.type]
+  // Non-strings are ignored rather than coerced: '[object Object]' is a worse
+  // filename than the inherited or default one, and a raw non-string would throw
+  // out of the sanitizer downstream.
+  const declaredTitle = typeof input.title === 'string' ? input.title : '';
+  const declaredLanguage = typeof input.language === 'string' ? input.language : '';
+  const language = declaredLanguage
+    || languageForArtifactType(input.type)
     || known.language
-    || ARTIFACT_TYPE_LANGUAGES[known.type]
+    || languageForArtifactType(known.type)
     || 'txt';
 
   return {
-    title: input.title || known.title || 'Untitled',
+    title: declaredTitle || known.title || 'Untitled',
     language,
     type: isProgrammingLanguage(language) ? 'code' : 'document',
-    identifier: input.id || null,
-    content: input.content.trim(),
+    identifier: typeof input.id === 'string' ? input.id : null,
+    content,
   };
 }
 
@@ -683,11 +710,12 @@ function filenameKey(name) {
 
 // Characters that are legal in a JS string and in a ZIP entry name but not in
 // a filename. Unassigned code points and noncharacters (both General_Category
-// Cn) are rejected outright by APFS, and an unpaired surrogate is worse: JSZip
-// encodes entry names as UTF-8 and maps every surrogate to U+FFFD, so two
-// conversations whose titles differ only in an unpaired surrogate become one
-// byte-identical archive entry — invisible to every check we make, because the
-// in-memory JS strings really are distinct.
+// Cn) are rejected outright by APFS, and an unpaired surrogate cannot survive an
+// entry name either: in the browser JSZip encodes it as CESU-8, which is not
+// valid UTF-8, so the name is malformed in the archive; under Node it maps every
+// surrogate to U+FFFD, which additionally collapses two titles differing only in
+// an unpaired surrogate into one byte-identical entry. The measurement behind the
+// second half was taken under Node, where the tests run, not in the browser.
 const UNSAFE_CODE_POINTS = /[\p{Cn}\p{Cs}]/gu;
 
 // Per-component cap, counted in UTF-8 bytes. Filesystems disagree about the
@@ -1425,7 +1453,16 @@ function uniqueZipPath(zip, path) {
 const ZIP_TEXT_ENCODER = new TextEncoder();
 
 function toZipBytes(content) {
-  return typeof content === 'string' ? ZIP_TEXT_ENCODER.encode(content) : content;
+  if (typeof content === 'string') return ZIP_TEXT_ENCODER.encode(content);
+  // JSZip writes null and undefined as a silent zero-byte entry, and the manifest
+  // reconciliation only checks that an entry exists, never its size — so an empty
+  // file would reconcile as a success and earn an export timestamp. Every producer
+  // returns a string today; this keeps the one chokepoint from being the place a
+  // future one slips through.
+  if (content === null || content === undefined) {
+    throw new Error('Refusing to write ZIP content that is missing');
+  }
+  return content;
 }
 
 const zipWrittenPaths = new WeakMap();
