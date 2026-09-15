@@ -182,19 +182,40 @@ describe('dedupeConversationNames', () => {
     expect(capped.length).toBeLessThanOrEqual(100);
   });
 
-  it('caps by UTF-16 units, which is what the filesystem counts', () => {
-    // An astral character costs two units. Counting code points let a
-    // flat-mode path reach 440 units against a 255-unit limit.
-    const capped = dedupeConversationNames([conv('u1', String.fromCodePoint(0x1f600).repeat(200))]).get('u1');
-    expect(capped.length).toBeLessThanOrEqual(100);
-    expect([...capped].length).toBe(50);
+  it('caps by UTF-8 bytes, the stricter of the two filesystem rules', () => {
+    // An astral character is 4 bytes and 2 UTF-16 units; a CJK character is
+    // 3 bytes and 1 unit. Counting units let a CJK title reach 300 bytes
+    // against ext4's 255-byte component limit.
+    const bytes = (s) => new TextEncoder().encode(s).length;
+
+    const astral = dedupeConversationNames([conv('u1', String.fromCodePoint(0x1f600).repeat(200))]).get('u1');
+    expect(bytes(astral)).toBeLessThanOrEqual(100);
+    expect([...astral].length).toBe(25);
+
+    const cjk = dedupeConversationNames([conv('u1', '\u4e2d'.repeat(200))]).get('u1');
+    expect(bytes(cjk)).toBeLessThanOrEqual(100);
+    expect([...cjk].length).toBe(33);
+
+    // 2 bytes, 1 unit — accented Latin, Greek, Cyrillic, Hebrew, Arabic.
+    const latin1 = dedupeConversationNames([conv('u1', '\u00e9'.repeat(200))]).get('u1');
+    expect(bytes(latin1)).toBeLessThanOrEqual(100);
+    expect([...latin1].length).toBe(50);
   });
 
-  it('keeps a flat-mode composite inside the filesystem limit', () => {
+  it('keeps a CJK flat-mode composite inside ext4\'s byte limit', () => {
+    const bytes = (s) => new TextEncoder().encode(s).length;
+    const name = dedupeConversationNames([conv('u1', '\u4e2d'.repeat(200))]).get('u1');
+    const artifact = dedupeConversationNames([conv('u2', '\u4e2d'.repeat(200))]).get('u2');
+    expect(bytes(`Artifacts/${name}_2725_${artifact}_99.dockerfile`)).toBeLessThan(255);
+  });
+
+  it('keeps an astral flat-mode composite inside the filesystem limit', () => {
     const astral = String.fromCodePoint(0x1f600).repeat(200);
     const name = dedupeConversationNames([conv('u1', astral)]).get('u1');
     const artifact = `${'x'.repeat(100)}.dockerfile`;
-    expect(`Artifacts/${name}_2725_${artifact}`.length).toBeLessThan(255);
+    const composite = `Artifacts/${name}_2725_${artifact}`;
+    expect(composite.length).toBeLessThan(255);                              // APFS / NTFS
+    expect(new TextEncoder().encode(composite).length).toBeLessThan(255);     // ext4
   });
 
   it('caps to exactly the limit, pinning the lower bound too', () => {

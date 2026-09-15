@@ -613,21 +613,36 @@ function filenameKey(name) {
 // in-memory JS strings really are distinct.
 const UNSAFE_CODE_POINTS = /[\p{Cn}\p{Cs}]/gu;
 
-// Per-component cap, in UTF-16 code units because that is what APFS and NTFS
-// count — an astral character costs two. ditto skips an over-long entry and
-// continues, so one long name loses its own file rather than the archive's,
-// but it loses it silently. Flat mode joins two capped names with an
-// underscore and appends suffixes and an extension afterwards, so the bound
-// that matters is 2N + suffixes + separator + extension <= 255; N = 100 leaves
-// room.
-const MAX_NAME_UNITS = 100;
+// Per-component cap, counted in UTF-8 bytes. Filesystems disagree about the
+// unit: APFS and NTFS cap a component at 255 UTF-16 code units, while ext4 and
+// most Linux filesystems cap it at 255 bytes. A UTF-8 encoding is never shorter
+// in bytes than the UTF-16 one is in units, so budgeting bytes bounds both —
+// where counting units does not: 100 CJK characters are 100 units but 300
+// bytes, and two such names joined in flat mode reach 622.
+//
+// ditto skips an over-long entry and continues, so one long name loses its own
+// file rather than the archive's — but it loses it silently, and the manifest
+// still records it as exported. Flat mode joins two capped names with an
+// underscore then appends suffixes and an extension, so the bound that matters
+// is 2N + suffixes + separator + extension <= 255; N = 100 leaves room.
+const MAX_NAME_BYTES = 100;
+
+function utf8Size(character) {
+  const codePoint = character.codePointAt(0);
+  if (codePoint < 0x80) return 1;
+  if (codePoint < 0x800) return 2;
+  if (codePoint < 0x10000) return 3;
+  return 4;
+}
 
 function capNameLength(name) {
-  if (name.length <= MAX_NAME_UNITS) return name;
   let capped = '';
+  let bytes = 0;
   for (const character of name) {          // iterates by code point
-    if (capped.length + character.length > MAX_NAME_UNITS) break;
+    const size = utf8Size(character);
+    if (bytes + size > MAX_NAME_BYTES) break;
     capped += character;
+    bytes += size;
   }
   return capped;
 }
