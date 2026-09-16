@@ -1083,9 +1083,10 @@ describe('chat body and artifacts folder agree', () => {
 });
 
 describe('browse-page relay tab selection', () => {
-  const tab = (id, { win = 1, ready = true } = {}) => ({
+  const tab = (id, { win = 1, ready = true, frozen = false } = {}) => ({
     id, windowId: win,
     discarded: !ready,
+    frozen,
     status: ready ? 'complete' : 'loading',
   });
 
@@ -1094,6 +1095,17 @@ describe('browse-page relay tab selection', () => {
       expect(isReadyTab({ discarded: false, status: 'complete' })).toBe(true);
       expect(isReadyTab({ discarded: true, status: 'complete' })).toBe(false);
       expect(isReadyTab({ discarded: false, status: 'loading' })).toBe(false);
+    });
+
+    it('rejects a frozen tab, which keeps a live renderer but cannot answer', () => {
+      // Chrome 132+ and Edge sleeping tabs. It passes every other test, so
+      // without this it ranks first and then costs a whole ping budget.
+      expect(isReadyTab({ discarded: false, frozen: true, status: 'complete' })).toBe(false);
+    });
+
+    it('treats an absent frozen property as not frozen', () => {
+      // Firefox and older Chrome do not report it.
+      expect(isReadyTab({ discarded: false, status: 'complete' })).toBe(true);
     });
   });
 
@@ -1105,6 +1117,11 @@ describe('browse-page relay tab selection', () => {
       const here = [tab(11, { ready: false })];
       const all = [tab(11, { ready: false }), tab(22, { win: 2 })];
       expect(orderClaudeTabs(here, all).map(t => t.id)).toEqual([22, 11]);
+    });
+
+    it('ranks a frozen tab behind an awake one', () => {
+      const here = [tab(11, { frozen: true }), tab(12)];
+      expect(orderClaudeTabs(here, here).map(t => t.id)).toEqual([12, 11]);
     });
 
     it('prefers the current window among tabs that are equally ready', () => {
@@ -1119,7 +1136,6 @@ describe('browse-page relay tab selection', () => {
     });
 
     it('lists each tab once even though the queries overlap', () => {
-      // The all-windows query is a superset of the current-window one.
       const here = [tab(11), tab(12)];
       const all = [tab(11), tab(12), tab(22, { win: 2 })];
       expect(orderClaudeTabs(here, all).map(t => t.id)).toEqual([11, 12, 22]);
@@ -1131,57 +1147,50 @@ describe('browse-page relay tab selection', () => {
   });
 
   describe('chooseRelayTab', () => {
-    const probeFrom = (states) => {
+    const probeFrom = (answers) => {
       const asked = [];
-      const probe = async (id) => { asked.push(id); return states[id]; };
+      const probe = async (id) => { asked.push(id); return answers[id] === true; };
       probe.asked = asked;
       return probe;
     };
 
-    it('takes the first tab that answers the ping', async () => {
-      const probe = probeFrom({ 1: 'alive', 2: 'alive' });
+    it('takes the first tab, in preference order, that answers', async () => {
+      const probe = probeFrom({ 1: true, 2: true });
       expect((await chooseRelayTab([tab(1), tab(2)], probe)).id).toBe(1);
     });
 
-    it('stops probing once a tab answers', async () => {
-      const probe = probeFrom({ 1: 'alive', 2: 'alive' });
-      await chooseRelayTab([tab(1), tab(2)], probe);
-      expect(probe.asked).toEqual([1]);
-    });
-
-    it('skips a silent tab and takes a live one behind it', async () => {
-      // Silence is the wedged case: a listener holding the channel open and
-      // never replying, which is what hung the page indefinitely.
-      const probe = probeFrom({ 1: 'silent', 2: 'alive' });
+    it('skips a tab that does not answer and takes the next that does', async () => {
+      const probe = probeFrom({ 1: false, 2: true });
       expect((await chooseRelayTab([tab(1), tab(2)], probe)).id).toBe(2);
     });
 
-    it('never chooses a silent tab, even as the last resort', async () => {
-      const probe = probeFrom({ 1: 'silent', 2: 'silent' });
+    it('never chooses a tab that failed the probe, however it failed', async () => {
+      // A tab with no content script and a wedged one are equally unusable, and
+      // preferring either over a clear error only produces a worse error later.
+      const probe = probeFrom({ 1: false, 2: false });
       expect(await chooseRelayTab([tab(1), tab(2)], probe)).toBeNull();
     });
 
-    it('falls back to a tab that answered with an error', async () => {
-      // A content script injected before the ping handler existed refuses the
-      // ping but still serves the real actions, and the double-injection guard
-      // means an extension update cannot replace it until the tab reloads.
-      const probe = probeFrom({ 1: 'responsive' });
-      expect((await chooseRelayTab([tab(1)], probe)).id).toBe(1);
+    it('probes concurrently rather than in turn', async () => {
+      // Serial probing multiplied the page's wait by the number of unresponsive
+      // tabs, which is ordinary after a session restore.
+      const probe = probeFrom({ 1: true, 2: true, 3: true });
+      await chooseRelayTab([tab(1), tab(2), tab(3)], probe);
+      expect(probe.asked).toEqual([1, 2, 3]);
     });
 
-    it('prefers a tab that ponged over an earlier one that only errored', async () => {
-      const probe = probeFrom({ 1: 'responsive', 2: 'alive' });
-      expect((await chooseRelayTab([tab(1), tab(2)], probe)).id).toBe(2);
-    });
-
-    it('keeps the first error-answering tab, not the last', async () => {
-      const probe = probeFrom({ 1: 'responsive', 2: 'responsive' });
+    it('still honours order when a later tab answers first', async () => {
+      // Concurrency must not let whichever replies soonest win.
+      const asked = [];
+      const probe = async (id) => {
+        asked.push(id);
+        await new Promise(resolve => setTimeout(resolve, id === 1 ? 20 : 0));
+        return true;
+      };
       expect((await chooseRelayTab([tab(1), tab(2)], probe)).id).toBe(1);
     });
 
     it('returns null for no candidates rather than throwing', async () => {
-      // pickClaudeTab used to index an empty array and throw from inside a
-      // callback, where the rejection could not be observed.
       expect(await chooseRelayTab([], probeFrom({}))).toBeNull();
     });
   });

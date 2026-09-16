@@ -251,33 +251,69 @@ async function loadOrgId() {
 
 // Helper function to find a claude.ai tab and send a message
 // A content script that keeps the message channel open and never answers looks
-// exactly like one that is merely slow, and the call this relays is legitimately
-// slow: fetchAllConversations retries a 429 with the server's Retry-After, up to
-// MAX_RETRY_ATTEMPTS times. A deadline on the work therefore cuts off a request
-// that was going to succeed, and tells the user to reload a tab that is fine.
-// So the deadline is on liveness instead: a ping any healthy content script
-// answers at once establishes that the tab can respond, and the real request
-// then runs without a deadline of its own.
+// exactly like one that is merely slow, so liveness is established by asking: a
+// ping any healthy content script answers at once. The real request then runs on
+// a budget sized to that request, not to the page's patience.
 const RELAY_PING_TIMEOUT_MS = 1500;
 
-// Not a deadline for the work — a stop against an unbounded hang if a handler
-// wedges after answering the ping. Derived from the retry budget so it cannot
-// drift below a wait that is legitimate.
-const RELAY_BACKSTOP_MS = MAX_RETRY_ATTEMPTS * MAX_RETRY_DELAY_MS + 60000;
+// Discovery needs its own guard. An extension reload erases in-flight API
+// requests without invoking their callbacks, so chrome.tabs.query can simply
+// never answer — and a promise waiting on that callback would hang the page
+// forever, which is the symptom this whole mechanism exists to remove.
+const RELAY_QUERY_TIMEOUT_MS = 5000;
 
+// A single fetch with no retry behind it. detectOrgId and loadProjects are both
+// this: one request, no backoff.
+const RELAY_DEFAULT_TIMEOUT_MS = 30000;
+
+// Only the conversation list retries, honouring the server's Retry-After. Its
+// budget has to cover the sleeping *and* the requests between the sleeps, or a
+// call that is still making progress is abandoned and the tab blamed for it.
+const RELAY_RETRY_TIMEOUT_MS =
+  MAX_RETRY_ATTEMPTS * MAX_RETRY_DELAY_MS + (MAX_RETRY_ATTEMPTS + 1) * 30000;
+
+// Per action, because one budget cannot fit both: the retry-derived figure is
+// minutes long, and applying it to an unretried call would let the original
+// complaint — a page stuck on "Fetching organization ID..." — last that long.
+const RELAY_ACTION_TIMEOUTS = {
+  __proto__: null,
+  loadConversations: RELAY_RETRY_TIMEOUT_MS,
+};
+
+function relayTimeoutFor(action) {
+  return RELAY_ACTION_TIMEOUTS[action] || RELAY_DEFAULT_TIMEOUT_MS;
+}
+
+// Resolves to { tabs, error }: a query that fails and a query that finds nothing
+// are different answers, and telling someone to open a claude.ai tab they are
+// already looking at is worse than saying what went wrong.
 function queryTabs(query) {
   return new Promise(resolve => {
-    chrome.tabs.query(query, (tabs) => {
-      // Read inside the callback so Chrome does not log it as unchecked. A
-      // failed query is reported as no tabs, leaving the caller's other query
-      // to supply candidates.
-      if (chrome.runtime.lastError) {
-        console.warn('Tab query failed:', chrome.runtime.lastError.message);
-        resolve([]);
-        return;
-      }
-      resolve(tabs || []);
-    });
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+
+    const timer = setTimeout(
+      () => finish({ tabs: [], error: 'the browser did not answer a tab query' }),
+      RELAY_QUERY_TIMEOUT_MS);
+
+    try {
+      chrome.tabs.query(query, (tabs) => {
+        // Read inside the callback, or Chrome logs it as an unchecked error.
+        if (chrome.runtime.lastError) {
+          finish({ tabs: [], error: chrome.runtime.lastError.message });
+          return;
+        }
+        finish({ tabs: tabs || [], error: null });
+      });
+    } catch (error) {
+      // An invalidated extension context throws here rather than calling back.
+      finish({ tabs: [], error: error.message });
+    }
   });
 }
 
@@ -291,66 +327,65 @@ function sendToTab(tabId, message, timeoutMs) {
       fn(value);
     };
 
-    const timer = setTimeout(() => {
-      const error = new Error(`No reply from the claude.ai tab within ${timeoutMs}ms`);
-      // Silence and refusal are different states, and only silence means the
-      // tab cannot be used at all.
-      error.relayTimedOut = true;
-      finish(reject, error);
-    }, timeoutMs);
+    const timer = setTimeout(() => finish(reject, new Error(
+      `No reply from the claude.ai tab within ${Math.round(timeoutMs / 1000)}s`
+    )), timeoutMs);
 
-    chrome.tabs.sendMessage(tabId, message, (response) => {
-      if (chrome.runtime.lastError) {
-        finish(reject, new Error(chrome.runtime.lastError.message));
-      } else {
-        finish(resolve, response);
-      }
-    });
+    try {
+      chrome.tabs.sendMessage(tabId, message, (response) => {
+        if (chrome.runtime.lastError) {
+          finish(reject, new Error(chrome.runtime.lastError.message));
+        } else {
+          finish(resolve, response);
+        }
+      });
+    } catch (error) {
+      // Routed through finish so the timer is cleared; a bare throw out of the
+      // executor rejects the promise but leaves the timer armed.
+      finish(reject, error);
+    }
   });
 }
 
-// 'alive'      — answered the ping, so it is running a current content script.
-// 'responsive' — answered with an error, which still proves the message plumbing
-//                works. A tab injected before this version has no ping handler
-//                and lands here; the double-injection guard means an extension
-//                update cannot replace its listener, so it must keep working
-//                until the tab is reloaded.
-// 'silent'     — held the channel open and said nothing. This is the wedged
-//                case, and the only one worth refusing outright.
+// True only if the tab answered the ping. Every failure — no receiver, a
+// listener that threw, silence from a wedged or frozen renderer — means this
+// tab cannot serve the request.
 async function pingClaudeTab(tabId) {
   try {
     const response = await sendToTab(tabId, { action: 'ping' }, RELAY_PING_TIMEOUT_MS);
-    return response && response.success ? 'alive' : 'responsive';
+    return Boolean(response && response.success);
   } catch (error) {
-    return error.relayTimedOut ? 'silent' : 'responsive';
+    return false;
   }
 }
 
 async function sendMessageToClaudeTab(action, data) {
   // Both queries run: the current window is a preference, not a filter, so a
   // sibling tab cannot hide a working one in another window.
-  const [current, all] = await Promise.all([
+  const [here, everywhere] = await Promise.all([
     queryTabs({ url: 'https://claude.ai/*', currentWindow: true }),
     queryTabs({ url: 'https://claude.ai/*' }),
   ]);
 
-  const candidates = orderClaudeTabs(current, all);
+  const candidates = orderClaudeTabs(here.tabs, everywhere.tabs);
   if (candidates.length === 0) {
-    throw new Error('Please open a claude.ai tab first to use this feature');
+    const failure = everywhere.error || here.error;
+    throw new Error(failure
+      ? `Could not look for a claude.ai tab: ${failure}`
+      : 'Please open a claude.ai tab first to use this feature');
   }
 
   const chosen = await chooseRelayTab(candidates, pingClaudeTab);
-
   if (!chosen) {
-    throw new Error(
-      'No claude.ai tab answered. Reload your claude.ai tab and try again.');
+    throw new Error('No claude.ai tab answered. If one is asleep, click it to '
+      + 'wake it; otherwise reload it and try again.');
   }
 
-  // No deadline of the caller's making from here on: the tab has proved it can
-  // answer, so a long wait is the retry logic doing its job.
+  // The tab has proved it can answer, so from here a long wait means the request
+  // is working, not that the tab is dead.
   let response;
   try {
-    response = await sendToTab(chosen.id, { action, ...data }, RELAY_BACKSTOP_MS);
+    response = await sendToTab(chosen.id, { action, ...data }, relayTimeoutFor(action));
   } catch (error) {
     // Chrome's own messages already end in a period; ours must not double it.
     const detail = error.message.replace(/[.\s]*$/, '');

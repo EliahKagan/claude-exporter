@@ -63,7 +63,7 @@ function convertToMarkdown(data, includeMetadata, conversationId = null, include
   const branchMessages = getCurrentBranch(data);
   // Shared with the artifact-file extractor so a rewritten artifact is named and
   // fenced the same way in the chat body as in the artifacts folder.
-  const artifactMeta = collectArtifactMeta(branchMessages);
+  const artifactMeta = collectArtifactMeta(data.chat_messages || []);
 
   for (const message of branchMessages) {
     const sender = message.sender === 'human' ? '## User' : '## Claude';
@@ -164,7 +164,7 @@ function convertToText(data, includeMetadata, includeArtifacts = true, includeTh
 
   // Get only the current branch messages
   const branchMessages = getCurrentBranch(data);
-  const artifactMeta = collectArtifactMeta(branchMessages);
+  const artifactMeta = collectArtifactMeta(data.chat_messages || []);
 
   branchMessages.forEach((message) => {
     // Extract artifacts from the entire message (handles both old and new formats)
@@ -266,6 +266,7 @@ const ARTIFACT_TYPE_LANGUAGES = {
   __proto__: null,
   'text/markdown': 'markdown',
   'text/html': 'html',
+  'text/css': 'css',
   'image/svg+xml': 'svg',
   'application/vnd.ant.code': '',
   'application/vnd.ant.react': 'jsx',
@@ -340,6 +341,30 @@ function artifactFromToolInput(input, artifactMeta) {
   };
 }
 
+// Both display_content shapes describe an artifact the same way, and both arrive
+// straight from the API. A non-string filename or body would throw out of the
+// filename sanitizer and fail the entire conversation; an empty body is refused
+// so the tool-call fallback can supply the real one, because writing a zero-byte
+// file instead counts as a written file and marks the conversation exported.
+function artifactFromDisplayBody(filename, language, code) {
+  if (typeof code !== 'string') return null;
+
+  const content = code.trim();
+  if (content === '') return null;
+
+  const name = typeof filename === 'string' ? filename : '';
+  const title = name.split('/').pop().replace(/\.[^.]+$/, '');
+  const resolved = (typeof language === 'string' && language) ? language : 'txt';
+
+  return {
+    title: title || 'Untitled',
+    language: resolved,
+    type: isProgrammingLanguage(resolved) ? 'code' : 'document',
+    identifier: null,
+    content,
+  };
+}
+
 function extractArtifactsFromMessage(message, artifactMeta) {
   const artifacts = [];
 
@@ -362,21 +387,10 @@ function extractArtifactsFromMessage(message, artifactMeta) {
         const displayContent = content.display_content || {};
 
         // Check for code_block format (newer artifact format)
-        if (displayContent.type === 'code_block' && displayContent.code) {
-          const language = displayContent.language || 'txt';
-          const code = displayContent.code || '';
-          const filename = displayContent.filename || 'artifact';
-
-          // Extract title from filename (remove path and extension)
-          const title = filename.split('/').pop().replace(/\.[^.]+$/, '');
-
-          artifacts.push({
-            title: title || 'Untitled',
-            language: language,
-            type: isProgrammingLanguage(language) ? 'code' : 'document',
-            identifier: null,
-            content: code.trim(),
-          });
+        if (displayContent.type === 'code_block') {
+          const artifact = artifactFromDisplayBody(
+            displayContent.filename || 'artifact', displayContent.language, displayContent.code);
+          if (artifact) artifacts.push(artifact);
         }
         // Check for json_block format (older artifact format)
         else if (displayContent.type === 'json_block' && displayContent.json_block) {
@@ -385,21 +399,9 @@ function extractArtifactsFromMessage(message, artifactMeta) {
 
             // Only treat as artifact if it has a filename (real artifacts, not tool uses like bash)
             if (artifactData.filename) {
-              // Extract artifact details
-              const language = artifactData.language || 'txt';
-              const code = artifactData.code || '';
-              const filename = artifactData.filename;
-
-              // Extract title from filename (remove path and extension)
-              const title = filename.split('/').pop().replace(/\.[^.]+$/, '');
-
-              artifacts.push({
-                title: title || 'Untitled',
-                language: language,
-                type: isProgrammingLanguage(language) ? 'code' : 'document',
-                identifier: null,
-                content: code.trim(),
-              });
+              const artifact = artifactFromDisplayBody(
+                artifactData.filename, artifactData.language, artifactData.code);
+              if (artifact) artifacts.push(artifact);
             }
           } catch (e) {
             // JSON parse failed, skip this artifact
@@ -586,7 +588,8 @@ function isProgrammingLanguage(language) {
     'swift', 'go', 'rust', 'jsx', 'tsx', 'shell', 'bash', 'sql', 'kotlin', 'scala',
     'r', 'perl', 'lua', 'dart', 'elixir', 'erlang', 'haskell', 'clojure', 'fsharp',
     'f#', 'c#', 'csharp', 'objective-c', 'ocaml', 'scheme', 'lisp', 'fortran',
-    'assembly', 'asm', 'groovy', 'html', 'css', 'scss', 'sass', 'less', 'stylus'
+    'assembly', 'asm', 'groovy', 'html', 'css', 'scss', 'sass', 'less', 'stylus',
+    'svg'
   ];
   return programmingLanguages.includes(String(language || '').toLowerCase());
 }
@@ -759,7 +762,7 @@ function extractArtifactFiles(data, artifactFormat = 'original') {
 
   // Get only the current branch messages
   const branchMessages = getCurrentBranch(data);
-  const artifactMeta = collectArtifactMeta(branchMessages);
+  const artifactMeta = collectArtifactMeta(data.chat_messages || []);
 
   for (const message of branchMessages) {
     const artifacts = extractArtifactsFromMessage(message, artifactMeta);
@@ -1252,7 +1255,11 @@ function assertConversationShape(data) {
 // touch chrome.tabs.
 
 function isReadyTab(tab) {
-  return !tab.discarded && tab.status === 'complete';
+  // `frozen` is Chrome 132+ and Edge's sleeping tabs, and is absent elsewhere —
+  // where `!undefined` is true and the check simply does not apply. A frozen tab
+  // keeps a live renderer, so it passes every other test and then cannot process
+  // the message, costing a full ping budget before it is ruled out.
+  return !tab.discarded && !tab.frozen && tab.status === 'complete';
 }
 
 // Ready tabs before asleep ones, and only within each group the current window
@@ -1273,22 +1280,21 @@ function orderClaudeTabs(current, all) {
   ];
 }
 
-// Picks the first tab that answers the probe, stopping as soon as one does. A
-// tab that answers with an error is kept only as a fallback: it proves the
-// message plumbing works, which is what a content script predating the ping
-// handler looks like, but a tab that actually ponged is always preferred.
-// A tab that says nothing is never chosen — that is the wedged case this
-// exists to route around.
+// Picks the first tab, in preference order, that answers the probe.
+//
+// Probing runs concurrently: an unresponsive tab costs the whole ping budget,
+// and several at once is ordinary rather than exotic — a window of slept
+// background tabs — so probing them in turn multiplied the page's wait by their
+// number. Order still decides the winner; only the waiting overlaps.
+//
+// A tab that fails the probe is never chosen, however it failed. An extension
+// update replaces the content script in a brand-new isolated world, so a tab
+// still running an older generation of it is not a case that arises; what does
+// arise is a tab with no content script at all, and preferring one of those over
+// reporting a clear error only produces a worse error later.
 async function chooseRelayTab(candidates, probe) {
-  let fallback = null;
-
-  for (const tab of candidates) {
-    const state = await probe(tab.id);
-    if (state === 'alive') return tab;
-    if (state === 'responsive' && fallback === null) fallback = tab;
-  }
-
-  return fallback;
+  const answered = await Promise.all(candidates.map(tab => probe(tab.id)));
+  return candidates.find((tab, index) => answered[index]) || null;
 }
 
 // Reserved ZIP entry name for the per-run export manifest. Both forms are
@@ -1534,8 +1540,12 @@ function addZipFile(zip, path, content) {
     throw error;
   }
 
+  // Encoded first: a refused write must not reserve the path, or a later
+  // legitimate write of it is rejected as a duplicate that does not exist.
+  const bytes = toZipBytes(content);
+
   written.add(key);
-  zip.file(path, toZipBytes(content));
+  zip.file(path, bytes);
 }
 
 // Enforces "never claim success for data that is not in the archive": an entry
