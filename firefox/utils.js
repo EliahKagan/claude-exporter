@@ -63,7 +63,8 @@ function convertToMarkdown(data, includeMetadata, conversationId = null, include
   const branchMessages = getCurrentBranch(data);
   // Shared with the artifact-file extractor so a rewritten artifact is named and
   // fenced the same way in the chat body as in the artifacts folder.
-  const artifactMeta = collectArtifactMeta(data.chat_messages || []);
+  const artifactMeta = collectArtifactMeta(
+    [...branchMessages, ...(data.chat_messages || [])]);
 
   for (const message of branchMessages) {
     const sender = message.sender === 'human' ? '## User' : '## Claude';
@@ -164,7 +165,8 @@ function convertToText(data, includeMetadata, includeArtifacts = true, includeTh
 
   // Get only the current branch messages
   const branchMessages = getCurrentBranch(data);
-  const artifactMeta = collectArtifactMeta(data.chat_messages || []);
+  const artifactMeta = collectArtifactMeta(
+    [...branchMessages, ...(data.chat_messages || [])]);
 
   branchMessages.forEach((message) => {
     // Extract artifacts from the entire message (handles both old and new formats)
@@ -259,19 +261,44 @@ function downloadFile(content, filename, type = 'application/json') {
 // `application/vnd.ant.code` carries a separate `language`; for the rest the type
 // implies one, and the filename and format conversion downstream want the
 // language, not the type.
-const ARTIFACT_TYPE_LANGUAGES = {
-  // Null-prototyped so an unexpected `type` cannot reach Object.prototype: a
-  // call declaring type 'toString' would otherwise resolve to a function, which
-  // is truthy and short-circuits the rest of the language chain.
+// Both halves mirror what the legacy <antArtifact> path assigns, so one artifact
+// is named and fenced the same way whichever route it arrives by. `kind` does not
+// always follow from the language: a code artifact with no language declared is
+// still code, and markdown and mermaid are documents even though they render.
+//
+// Null-prototyped so an unexpected `type` cannot reach Object.prototype: a call
+// declaring type 'toString' would otherwise resolve to a function, which is
+// truthy and short-circuits the rest of the chain.
+const ARTIFACT_TYPES = {
   __proto__: null,
-  'text/markdown': 'markdown',
-  'text/html': 'html',
-  'text/css': 'css',
-  'image/svg+xml': 'svg',
-  'application/vnd.ant.code': '',
-  'application/vnd.ant.react': 'jsx',
-  'application/vnd.ant.mermaid': 'mermaid',
+  'text/markdown': { language: 'markdown', kind: 'document' },
+  'text/html': { language: 'html', kind: 'code' },
+  'text/css': { language: 'css', kind: 'code' },
+  'image/svg+xml': { language: 'svg', kind: 'code' },
+  // The only type carrying its own language. Empty here so the chain falls
+  // through to whatever the call or an earlier call declared.
+  'application/vnd.ant.code': { language: '', kind: 'code' },
+  'application/vnd.ant.react': { language: 'jsx', kind: 'code' },
+  'application/vnd.ant.mermaid': { language: 'mermaid', kind: 'document' },
 };
+
+function artifactTypeInfo(type) {
+  return (typeof type === 'string' && ARTIFACT_TYPES[type]) || null;
+}
+
+function languageForArtifactType(type) {
+  const info = artifactTypeInfo(type);
+  return (info && info.language) || '';
+}
+
+// Falls back to the language test only for a type nobody declared, which is
+// where the two routes used to disagree: `txt` is not a programming language, so
+// a code artifact with no language was typed a document and pasted in unfenced.
+function kindForArtifactType(type, language) {
+  const info = artifactTypeInfo(type);
+  if (info) return info.kind;
+  return isProgrammingLanguage(language) ? 'code' : 'document';
+}
 
 // A `rewrite` call carries only the new body and the artifact's id — no title,
 // type or language — so those are taken from whichever call first declared them
@@ -303,10 +330,6 @@ function collectArtifactMeta(messages) {
   return meta;
 }
 
-function languageForArtifactType(type) {
-  return typeof type === 'string' && ARTIFACT_TYPE_LANGUAGES[type] || '';
-}
-
 // Builds an artifact from the tool call's own arguments. `update` calls are
 // deliberately not handled: they carry an old_str/new_str patch rather than a
 // body, and every artifact whose only calls are patches has no rendered base to
@@ -335,7 +358,8 @@ function artifactFromToolInput(input, artifactMeta) {
   return {
     title: declaredTitle || known.title || 'Untitled',
     language,
-    type: isProgrammingLanguage(language) ? 'code' : 'document',
+    type: kindForArtifactType(input.type, language)
+      || kindForArtifactType(known.type, language),
     identifier: typeof input.id === 'string' ? input.id : null,
     content,
   };
@@ -352,14 +376,22 @@ function artifactFromDisplayBody(filename, language, code) {
   const content = code.trim();
   if (content === '') return null;
 
-  const name = typeof filename === 'string' ? filename : '';
+  // A filename that is present but not a string is refused rather than coerced.
+  // The tool call behind this rendering normally carries the real title and body,
+  // and returning a usable-looking artifact named 'Untitled' would satisfy the
+  // caller's "did we produce anything" test and suppress that fallback.
+  if (filename !== undefined && filename !== null && typeof filename !== 'string') {
+    return null;
+  }
+
+  const name = (filename === undefined || filename === null) ? 'artifact' : filename;
   const title = name.split('/').pop().replace(/\.[^.]+$/, '');
   const resolved = (typeof language === 'string' && language) ? language : 'txt';
 
   return {
     title: title || 'Untitled',
     language: resolved,
-    type: isProgrammingLanguage(resolved) ? 'code' : 'document',
+    type: kindForArtifactType(undefined, resolved),
     identifier: null,
     content,
   };
@@ -389,7 +421,7 @@ function extractArtifactsFromMessage(message, artifactMeta) {
         // Check for code_block format (newer artifact format)
         if (displayContent.type === 'code_block') {
           const artifact = artifactFromDisplayBody(
-            displayContent.filename || 'artifact', displayContent.language, displayContent.code);
+            displayContent.filename, displayContent.language, displayContent.code);
           if (artifact) artifacts.push(artifact);
         }
         // Check for json_block format (older artifact format)
@@ -762,7 +794,8 @@ function extractArtifactFiles(data, artifactFormat = 'original') {
 
   // Get only the current branch messages
   const branchMessages = getCurrentBranch(data);
-  const artifactMeta = collectArtifactMeta(data.chat_messages || []);
+  const artifactMeta = collectArtifactMeta(
+    [...branchMessages, ...(data.chat_messages || [])]);
 
   for (const message of branchMessages) {
     const artifacts = extractArtifactsFromMessage(message, artifactMeta);
@@ -1544,8 +1577,8 @@ function addZipFile(zip, path, content) {
   // legitimate write of it is rejected as a duplicate that does not exist.
   const bytes = toZipBytes(content);
 
-  written.add(key);
   zip.file(path, bytes);
+  written.add(key);
 }
 
 // Enforces "never claim success for data that is not in the archive": an entry

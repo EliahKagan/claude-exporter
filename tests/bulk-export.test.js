@@ -1260,6 +1260,237 @@ describe('addZipFile UTF-8 integrity', () => {
   });
 });
 
+describe('artifact extraction from the display rendering', () => {
+  // display_content is the rendering claude.ai attaches for its own UI, and it
+  // produced 307 of the 395 artifacts in a real 2725-conversation export. The
+  // guards below were originally added only to the tool-call path, so every one
+  // of these cases went unasserted while the commit claimed to have fixed them.
+  const call = (input, display_content) => ({
+    type: 'tool_use', name: 'artifacts', input, display_content,
+  });
+  const jsonBlock = (fields) => ({ type: 'json_block', json_block: JSON.stringify(fields) });
+  const fromBlocks = (blocks) => extractArtifactFiles({
+    name: 'Conv', uuid: 'u1', current_leaf_message_uuid: 'm2',
+    chat_messages: [
+      { uuid: 'm1', sender: 'human', parent_message_uuid: '00000000-0000-0000-0000-000000000000', content: [] },
+      { uuid: 'm2', sender: 'assistant', parent_message_uuid: 'm1', content: blocks },
+    ],
+  }, 'original');
+
+  const realBody = { command: 'create', id: 'a1', title: 'Real Title', type: 'text/markdown', content: 'the real body' };
+
+  it('falls through to the tool call when the rendering body is empty', () => {
+    // An empty rendering used to be written as a zero-byte file, which counts as
+    // a written artifact: it marked the conversation exported, earned it an
+    // export timestamp, and suppressed the fallback holding the real body.
+    expect(fromBlocks([call(realBody, jsonBlock({ filename: 'Solver.py', language: 'python', code: '' }))]))
+      .toEqual([{ filename: 'Real Title.md', content: 'the real body' }]);
+  });
+
+  it('falls through when the rendering body is only whitespace', () => {
+    expect(fromBlocks([call(realBody, jsonBlock({ filename: 'Solver.py', code: '   \n\t ' }))]))
+      .toEqual([{ filename: 'Real Title.md', content: 'the real body' }]);
+  });
+
+  it('falls through when the rendering body is not a string', () => {
+    expect(fromBlocks([call(realBody, { type: 'code_block', filename: 'a.py', code: 42 })]))
+      .toEqual([{ filename: 'Real Title.md', content: 'the real body' }]);
+  });
+
+  it('falls through when the rendering filename is not a string', () => {
+    // Refused rather than coerced: a usable-looking artifact named Untitled
+    // would satisfy the "did we produce anything" test and block the fallback.
+    expect(fromBlocks([call(realBody, jsonBlock({ filename: 7, language: 'markdown', code: 'rendered' }))]))
+      .toEqual([{ filename: 'Real Title.md', content: 'the real body' }]);
+  });
+
+  it('writes nothing at all when the rendering is empty and there is no fallback', () => {
+    expect(fromBlocks([call({ command: 'update', id: 'a1', old_str: 'x', new_str: 'y' },
+      jsonBlock({ filename: 'Solver.py', code: '' }))])).toEqual([]);
+  });
+
+  it('never fails the conversation over a malformed rendering', () => {
+    // A throw here is caught by the export loop as a failed conversation, which
+    // loses the chat file too, on every run.
+    for (const display of [
+      { type: 'code_block', filename: 42, code: 'x' },
+      { type: 'code_block', filename: {}, code: 'x' },
+      { type: 'code_block', filename: 'a.py', code: {} },
+      { type: 'code_block', filename: 'a.py', code: 'x', language: 42 },
+    ]) {
+      expect(() => fromBlocks([call({ command: 'create', id: 'a1' }, display)])).not.toThrow();
+    }
+  });
+
+  it('defaults a missing rendering filename to artifact, not to Untitled', () => {
+    expect(fromBlocks([call({ command: 'create', id: 'a1' },
+      { type: 'code_block', code: 'x', language: 'python' })]))
+      .toEqual([{ filename: 'artifact.py', content: 'x' }]);
+  });
+
+  it('names an extension-only rendering filename Untitled', () => {
+    // The extension comes from the language, not from the original filename, so
+    // one is declared here to keep the assertion about the title alone.
+    expect(fromBlocks([call({ command: 'create', id: 'a1' },
+      jsonBlock({ filename: '.md', language: 'markdown', code: 'body' }))])[0].filename)
+      .toBe('Untitled.md');
+  });
+
+  it('ignores a non-string rendering language rather than labelling the artifact with it', () => {
+    // The filename is a.txt either way, because getFileExtension coerces — so
+    // the language has to be asserted where it shows, in the chat body.
+    const data = {
+      name: 'C', uuid: 'u1', current_leaf_message_uuid: 'm2',
+      chat_messages: [
+        { uuid: 'm1', sender: 'human', parent_message_uuid: '00000000-0000-0000-0000-000000000000', content: [] },
+        { uuid: 'm2', sender: 'assistant', parent_message_uuid: 'm1', content: [
+          call({ command: 'create', id: 'a1' },
+            { type: 'code_block', filename: 'a', code: 'x', language: 42 }),
+        ] },
+      ],
+    };
+    expect(fromBlocks([call({ command: 'create', id: 'a1' },
+      { type: 'code_block', filename: 'a', code: 'x', language: 42 })])[0].filename).toBe('a.txt');
+    const markdown = convertToMarkdown(data, false, null, true, true);
+    expect(markdown).toContain('**Language:** txt');
+    expect(markdown).not.toContain('**Language:** 42');
+  });
+
+  it('types a rendering as code from its language, so the body is fenced', () => {
+    // The display route derives the kind from the language; typing everything a
+    // document would paste a python body into the markdown unfenced.
+    const data = {
+      name: 'C', uuid: 'u1', current_leaf_message_uuid: 'm2',
+      chat_messages: [
+        { uuid: 'm1', sender: 'human', parent_message_uuid: '00000000-0000-0000-0000-000000000000', content: [] },
+        { uuid: 'm2', sender: 'assistant', parent_message_uuid: 'm1', content: [
+          call({ command: 'create', id: 'a1' },
+            { type: 'code_block', filename: 'solver.py', code: 'print(1)', language: 'python' }),
+        ] },
+      ],
+    };
+    const markdown = convertToMarkdown(data, false, null, true, true);
+    expect(markdown).toContain('**Type:** code | **Language:** python');
+    expect(markdown).toContain('```python\nprint(1)\n```');
+  });
+});
+
+describe('artifact kind agrees between the two extraction routes', () => {
+  // The legacy <antArtifact> path assigns a kind per MIME type; the tool-call
+  // path used to derive it from the language alone. Where they disagreed, one
+  // route fenced the artifact and the other pasted its body into the markdown raw.
+  const kindOf = (type, extra = {}) => artifactFromToolInput(
+    { command: 'create', id: 'a1', title: 'T', type, content: 'body', ...extra }).type;
+
+  it('types a code artifact as code even with no language declared', () => {
+    // 'txt' is not a programming language, so this was typed a document and its
+    // body pasted in unfenced, while the legacy route fenced it.
+    expect(kindOf('application/vnd.ant.code')).toBe('code');
+  });
+
+  it('keeps the legacy kind for every type the legacy route knows', () => {
+    expect(kindOf('text/markdown')).toBe('document');
+    expect(kindOf('application/vnd.ant.mermaid')).toBe('document');
+    expect(kindOf('text/html')).toBe('code');
+    expect(kindOf('text/css')).toBe('code');
+    expect(kindOf('image/svg+xml')).toBe('code');
+    expect(kindOf('application/vnd.ant.react')).toBe('code');
+  });
+
+  it('files css and svg under their own extensions', () => {
+    const named = (type) => extractArtifactFiles({
+      name: 'C', uuid: 'u1', current_leaf_message_uuid: 'm2',
+      chat_messages: [
+        { uuid: 'm1', sender: 'human', parent_message_uuid: '00000000-0000-0000-0000-000000000000', content: [] },
+        { uuid: 'm2', sender: 'assistant', parent_message_uuid: 'm1', content: [{
+          type: 'tool_use', name: 'artifacts',
+          input: { command: 'create', id: 'a1', title: 'Theme', type, content: 'body' },
+        }] },
+      ],
+    }, 'original')[0].filename;
+    expect(named('text/css')).toBe('Theme.css');
+    expect(named('image/svg+xml')).toBe('Theme.svg');
+  });
+
+  it('fences an svg artifact in the chat body instead of pasting it raw', () => {
+    // Unfenced, a raw <svg> lands in the .md where renderers treat it as markup.
+    const data = {
+      name: 'C', uuid: 'u1', current_leaf_message_uuid: 'm2',
+      chat_messages: [
+        { uuid: 'm1', sender: 'human', parent_message_uuid: '00000000-0000-0000-0000-000000000000', content: [] },
+        { uuid: 'm2', sender: 'assistant', parent_message_uuid: 'm1', content: [{
+          type: 'tool_use', name: 'artifacts',
+          input: { command: 'create', id: 'a1', title: 'Diagram', type: 'image/svg+xml', content: '<svg/>' },
+        }] },
+      ],
+    };
+    expect(convertToMarkdown(data, false, null, true, true)).toContain('```svg');
+  });
+
+  it('fences an svg rendering, which carries a language but no type', () => {
+    // The display route has no MIME type to consult, so its kind comes from the
+    // language alone — and svg is not a programming language. Without it listed
+    // as code-like, a raw <svg> is pasted into the .md unfenced.
+    const data = {
+      name: 'C', uuid: 'u1', current_leaf_message_uuid: 'm2',
+      chat_messages: [
+        { uuid: 'm1', sender: 'human', parent_message_uuid: '00000000-0000-0000-0000-000000000000', content: [] },
+        { uuid: 'm2', sender: 'assistant', parent_message_uuid: 'm1', content: [{
+          type: 'tool_use', name: 'artifacts', input: { command: 'create', id: 'a1' },
+          display_content: { type: 'code_block', filename: 'd.svg', code: '<svg/>', language: 'svg' },
+        }] },
+      ],
+    };
+    const markdown = convertToMarkdown(data, false, null, true, true);
+    expect(markdown).toContain('**Type:** code | **Language:** svg');
+    expect(markdown).toContain('```svg');
+  });
+
+  it('falls back to the language test for a type nobody declared', () => {
+    expect(kindOf('application/x-unheard-of', { language: 'rust' })).toBe('code');
+    expect(kindOf('application/x-unheard-of', { language: 'plaintext' })).toBe('document');
+  });
+});
+
+describe('artifact metadata is scoped to the surviving branch first', () => {
+  const call = (input) => ({ type: 'tool_use', name: 'artifacts', input });
+  const msg = (uuid, parent, blocks) => ({
+    uuid, sender: 'assistant', parent_message_uuid: parent, content: blocks,
+  });
+
+  it('does not let an abandoned branch rename or re-extension a live artifact', () => {
+    // Model ids are regenerated slugs, so two branches declaring the same id is
+    // ordinary. chat_messages is chronological, so the abandoned branch declares
+    // first — and first-declaration-wins would hand it the naming.
+    const data = {
+      name: 'C', uuid: 'u1', current_leaf_message_uuid: 'm4',
+      chat_messages: [
+        msg('m1', '00000000-0000-0000-0000-000000000000', []),
+        msg('m2', 'm1', [call({ command: 'create', id: 'app', title: 'Todo App', type: 'application/vnd.ant.code', language: 'python', content: 'v1' })]),
+        msg('m3', 'm1', [call({ command: 'create', id: 'app', title: 'Task Manager', type: 'application/vnd.ant.code', language: 'rust', content: 'v2' })]),
+        msg('m4', 'm3', [call({ command: 'rewrite', id: 'app', content: 'v3' })]),
+      ],
+    };
+    // The rewrite belongs to the rust artifact; naming it Todo App.py would give
+    // a rust body a python extension.
+    expect(extractArtifactFiles(data, 'original').map(f => f.filename))
+      .toEqual(['Task Manager.rs', 'Task Manager_1.rs']);
+  });
+
+  it('still names a rewrite whose create survives only off the branch', () => {
+    // This is what widening the scope bought, and it has to keep working.
+    const data = {
+      name: 'C', uuid: 'u1', current_leaf_message_uuid: 'm3',
+      chat_messages: [
+        msg('m1', '00000000-0000-0000-0000-000000000000', []),
+        msg('m2', 'm1', [call({ command: 'create', id: 'rep', title: 'Report', type: 'text/markdown', content: 'v1' })]),
+        msg('m3', 'm1', [call({ command: 'rewrite', id: 'rep', content: 'v2' })]),
+      ],
+    };
+    expect(extractArtifactFiles(data, 'original').map(f => f.filename)).toEqual(['Report.md']);
+  });
+});
+
 describe('createPacer', () => {
   it('starts with no deadline, so the first request is not delayed', () => {
     expect(createPacer(200)).toEqual({ intervalMs: 200, notBefore: 0 });
@@ -1298,6 +1529,18 @@ describe('addZipFile', () => {
     const zip = new JSZip();
     addZipFile(zip, 'Chats/a.md', 'one');
     expect(() => addZipFile(zip, 'Artifacts/a.md', 'two')).not.toThrow();
+  });
+
+  it('does not reserve a path for a write it refused', () => {
+    // toZipBytes throws on missing content, and the reservation used to happen
+    // first — so a later legitimate write of that path was rejected as a
+    // duplicate of an entry that was never created, reported to the user as a
+    // filename collision.
+    const zip = new JSZip();
+    expect(() => addZipFile(zip, 'a.json', null)).toThrow(/Refusing to write/);
+    expect(() => addZipFile(zip, 'a.json', 'real')).not.toThrow();
+    // And the entry that did get written is the real one, not an empty stand-in.
+    expect(Object.keys(zip.files)).toEqual(['a.json']);
   });
 
   it('refuses a duplicate that differs only in case', () => {
